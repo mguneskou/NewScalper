@@ -1,0 +1,21 @@
+.env
+data/cache/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite3
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Claude Code's own local tool config/state -- not application code.
+.claude/
+
+# Machine-specific desktop shortcut (hardcoded absolute local path).
+*.lnk
+

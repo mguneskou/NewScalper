@@ -1,0 +1,40 @@
+# Non-secret app configuration. Secrets (API token, account ID) live in .env.
+
+instruments:
+  - EUR_USD
+  - GBP_USD
+  - USD_JPY
+  - EUR_GBP
+
+granularities:
+  - M1
+  - M5
+
+backtest:
+  years: 5
+  # Rolling walk-forward split: train on N months, validate (out-of-sample) on next M months.
+  # Validation windows tile forward with no gaps/overlap, so the stitched out-of-sample
+  # track record covers nearly the whole 5y span (minus the first training warm-up).
+  train_months: 12
+  validate_months: 4
+  # Cost model applied on top of historical bid/ask spread from the candles themselves.
+  slippage_pips: 0.2
+  commission_per_trade: 0.0
+
+risk_search:
+  stop_loss_pips: [3, 5, 8, 10, 15]
+  take_profit_pips: [5, 8, 10, 15, 20]
+  # Fixed, not searched: with zero commission, P&L scales linearly with size, so it
+  # never changes which SL/TP combo wins -- sizing is a live money-management
+  # decision layered on top, not part of the strategy's edge.
+  position_size_units: [1000]
+  # Not used by the single-instrument backtest engine (only one position at a time
+  # per instrument is modeled); this is a live-trading portfolio control only.
+  max_concurrent_positions: [1, 2, 3]
+
+live:
+  # Day boundary for "today's closed positions" and the daily loss-limit reset.
+  day_boundary_timezone: Europe/London
+  daily_loss_limit_gbp: 50.0
+  # auto = engine executes signals immediately; manual = signals wait for user accept/reject in the dashboard.
+  default_execution_mode: manual
