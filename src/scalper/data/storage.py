@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     validate_start TEXT,
     validate_end TEXT,
     is_out_of_sample INTEGER NOT NULL,
+    account_currency TEXT NOT NULL,
     trade_count INTEGER NOT NULL,
     win_rate REAL NOT NULL,
     profit_factor REAL NOT NULL,
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     max_drawdown REAL NOT NULL,
     max_drawdown_pct REAL NOT NULL,
     sharpe_ratio REAL NOT NULL,
+    avg_r_multiple REAL NOT NULL,
     ending_balance REAL NOT NULL
 );
 
@@ -58,9 +60,36 @@ CREATE TABLE IF NOT EXISTS backtest_trades (
     exit_price REAL NOT NULL,
     units INTEGER NOT NULL,
     pnl REAL NOT NULL,
+    pnl_quote_ccy REAL NOT NULL,
+    risk REAL NOT NULL,
     exit_reason TEXT NOT NULL
 );
 """
+
+# Columns added to a table after its original CREATE TABLE above, so `connect()`
+# can retrofit them onto a database file created before they existed --
+# `CREATE TABLE IF NOT EXISTS` only ever helps for a brand-new file, not one that
+# already has the table in an older shape. Every column here must also appear in
+# the CREATE TABLE statement above (so a fresh database gets it immediately);
+# this dict is purely what makes an *existing* database catch up.
+_COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
+    "backtest_runs": [
+        ("account_currency", "TEXT NOT NULL DEFAULT ''"),
+        ("avg_r_multiple", "REAL NOT NULL DEFAULT 0"),
+    ],
+    "backtest_trades": [
+        ("pnl_quote_ccy", "REAL NOT NULL DEFAULT 0"),
+        ("risk", "REAL NOT NULL DEFAULT 0"),
+    ],
+}
+
+
+def _apply_column_migrations(conn: sqlite3.Connection) -> None:
+    for table, columns in _COLUMN_MIGRATIONS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, column_def in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {column_def}")
 
 
 @contextmanager
@@ -74,6 +103,7 @@ def connect(db_path: Path | None = None):
     conn.execute("PRAGMA journal_mode = WAL")
     try:
         conn.executescript(SCHEMA)
+        _apply_column_migrations(conn)
         yield conn
         conn.commit()
     finally:
@@ -92,6 +122,7 @@ def save_backtest_run(
     validate_start: str | None,
     validate_end: str | None,
     is_out_of_sample: bool,
+    account_currency: str,
     metrics,
     trades,
 ) -> int:
@@ -102,9 +133,9 @@ def save_backtest_run(
         INSERT INTO backtest_runs (
             created_at, strategy_name, instrument, granularity, params_json,
             train_start, train_end, validate_start, validate_end, is_out_of_sample,
-            trade_count, win_rate, profit_factor, total_pnl, expectancy,
-            max_drawdown, max_drawdown_pct, sharpe_ratio, ending_balance
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            account_currency, trade_count, win_rate, profit_factor, total_pnl, expectancy,
+            max_drawdown, max_drawdown_pct, sharpe_ratio, avg_r_multiple, ending_balance
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             datetime.now(timezone.utc).isoformat(),
@@ -117,6 +148,7 @@ def save_backtest_run(
             validate_start,
             validate_end,
             int(is_out_of_sample),
+            account_currency,
             metrics.trade_count,
             metrics.win_rate,
             metrics.profit_factor,
@@ -125,6 +157,7 @@ def save_backtest_run(
             metrics.max_drawdown,
             metrics.max_drawdown_pct,
             metrics.sharpe_ratio,
+            metrics.avg_r_multiple,
             metrics.ending_balance,
         ),
     )
@@ -134,8 +167,8 @@ def save_backtest_run(
         """
         INSERT INTO backtest_trades (
             run_id, direction, entry_time, entry_price, exit_time, exit_price,
-            units, pnl, exit_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            units, pnl, pnl_quote_ccy, risk, exit_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -147,6 +180,8 @@ def save_backtest_run(
                 t.exit_price,
                 t.units,
                 t.pnl,
+                t.pnl_quote_ccy,
+                t.risk,
                 t.exit_reason,
             )
             for t in trades

@@ -16,6 +16,7 @@ import pandas as pd
 from numba import njit
 
 from scalper.backtest.costs import CostModel, pip_size
+from scalper.backtest.fx import FxConverter, quote_currency
 
 EXIT_REASONS = {0: "signal", 1: "stop_loss", 2: "take_profit", 3: "end_of_data"}
 
@@ -29,8 +30,19 @@ class Trade:
     exit_time: pd.Timestamp
     exit_price: float
     units: int
-    pnl: float
+    pnl: float  # in account_currency -- the figure to use for any cross-instrument comparison
+    pnl_quote_ccy: float  # raw P&L in the instrument's own quote currency, kept for auditability
+    risk: float  # amount risked at entry (stop distance x units), in account_currency
     exit_reason: str
+
+    @property
+    def r_multiple(self) -> float:
+        """P&L expressed as a multiple of what the trade risked at entry --
+        lets trades with different stop distances (fixed-pip or ATR-relative)
+        be compared and averaged on equal footing, unlike raw P&L, which a
+        fixed position size lets a tight-stop/high-frequency combo dominate
+        purely through volume rather than genuine edge."""
+        return self.pnl / self.risk if self.risk > 0 else 0.0
 
 
 @dataclass
@@ -44,7 +56,7 @@ class BacktestResult:
 def _simulate(
     bid_o, bid_h, bid_l, ask_o, ask_h, ask_l,
     sig,
-    sl_dist, tp_dist,
+    sl_dist_arr, tp_dist_arr,
     position_size_units,
     slippage_price,
     commission_per_trade,
@@ -56,6 +68,7 @@ def _simulate(
     out_entry_price = np.empty(n, dtype=np.float64)
     out_exit_price = np.empty(n, dtype=np.float64)
     out_pnl = np.empty(n, dtype=np.float64)
+    out_risk = np.empty(n, dtype=np.float64)
     out_reason = np.empty(n, dtype=np.int64)
     trade_count = 0
 
@@ -64,6 +77,7 @@ def _simulate(
     entry_price = 0.0
     stop_price = 0.0
     tp_price = 0.0
+    entry_risk = 0.0
 
     for i in range(n):
         if position_dir != 0:
@@ -104,6 +118,7 @@ def _simulate(
                 out_entry_price[trade_count] = entry_price
                 out_exit_price[trade_count] = exit_price
                 out_pnl[trade_count] = pnl
+                out_risk[trade_count] = entry_risk
                 out_reason[trade_count] = exit_reason
                 trade_count += 1
                 position_dir = 0
@@ -111,14 +126,18 @@ def _simulate(
         if position_dir == 0 and sig[i] != 0:
             position_dir = sig[i]
             entry_idx = i
+            # SL/TP distance is locked in at entry from that bar's value -- for an
+            # ATR-relative stop this means "sized to volatility when the trade was
+            # opened", not continuously re-sized while the position is held.
+            entry_risk = sl_dist_arr[i] * position_size_units
             if position_dir == 1:
                 entry_price = ask_o[i] + slippage_price
-                stop_price = entry_price - sl_dist
-                tp_price = entry_price + tp_dist
+                stop_price = entry_price - sl_dist_arr[i]
+                tp_price = entry_price + tp_dist_arr[i]
             else:
                 entry_price = bid_o[i] - slippage_price
-                stop_price = entry_price + sl_dist
-                tp_price = entry_price - tp_dist
+                stop_price = entry_price + sl_dist_arr[i]
+                tp_price = entry_price - tp_dist_arr[i]
 
     # force-close any still-open position at the final bar's price
     if position_dir != 0:
@@ -135,6 +154,7 @@ def _simulate(
         out_entry_price[trade_count] = entry_price
         out_exit_price[trade_count] = exit_price
         out_pnl[trade_count] = pnl
+        out_risk[trade_count] = entry_risk
         out_reason[trade_count] = 3
         trade_count += 1
 
@@ -145,19 +165,33 @@ def _simulate(
         out_entry_price[:trade_count],
         out_exit_price[:trade_count],
         out_pnl[:trade_count],
+        out_risk[:trade_count],
         out_reason[:trade_count],
     )
+
+
+def _as_pip_array(value: float | np.ndarray | pd.Series, n: int) -> np.ndarray:
+    """Broadcasts a fixed pip distance to every bar, or passes through a
+    per-bar distance (e.g. ATR-relative) already computed by the caller."""
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return np.full(n, float(value))
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.shape[0] != n:
+        raise ValueError(f"per-bar stop/take-profit array must have length {n}, got {arr.shape[0]}")
+    return arr
 
 
 def run_backtest(
     df: pd.DataFrame,
     signals: pd.Series,
     instrument: str,
-    stop_loss_pips: float,
-    take_profit_pips: float,
+    stop_loss_pips: float | np.ndarray | pd.Series,
+    take_profit_pips: float | np.ndarray | pd.Series,
     position_size_units: int,
     cost_model: CostModel,
     starting_balance: float = 10_000.0,
+    account_currency: str = "USD",
+    fx: FxConverter | None = None,
 ) -> BacktestResult:
     """Runs the simulation and returns realized trades + equity curve.
 
@@ -166,10 +200,21 @@ def run_backtest(
     internally, so a signal known at bar i's close is only acted on starting at
     bar i+1's open -- exactly what a real strategy could have done live. Do not
     pre-shift signals yourself.
+
+    `stop_loss_pips`/`take_profit_pips` are each either a single fixed distance
+    (the whole backtest uses the same SL/TP) or a per-bar array/Series aligned
+    with `df` (e.g. an ATR-relative distance that varies with volatility) --
+    whichever a trade's entry bar holds is what gets locked in for that trade.
+
+    P&L is computed in `instrument`'s own quote currency, then converted to
+    `account_currency` (via `fx`, required whenever the two differ) at the rate
+    prevailing at each trade's exit time -- the same way a broker marks a closed
+    trade's P&L to the account currency. This is what makes `total_pnl` safe to
+    sum or compare across instruments with different quote currencies.
     """
     pip = pip_size(instrument)
-    sl_dist = stop_loss_pips * pip
-    tp_dist = take_profit_pips * pip
+    sl_dist_arr = _as_pip_array(stop_loss_pips, len(df)) * pip
+    tp_dist_arr = _as_pip_array(take_profit_pips, len(df)) * pip
     slippage_price = cost_model.slippage_pips * pip
 
     effective_signal = signals.shift(1, fill_value=0).to_numpy().astype(np.int64)
@@ -182,21 +227,38 @@ def run_backtest(
     ask_h = df["ask_h"].to_numpy(dtype=np.float64)
     ask_l = df["ask_l"].to_numpy(dtype=np.float64)
 
-    (entry_idx, exit_idx, direction, entry_price, exit_price, pnl, reason) = _simulate(
+    (entry_idx, exit_idx, direction, entry_price, exit_price, pnl, risk, reason) = _simulate(
         bid_o, bid_h, bid_l, ask_o, ask_h, ask_l,
         effective_signal,
-        sl_dist, tp_dist,
+        sl_dist_arr, tp_dist_arr,
         float(position_size_units),
         slippage_price,
         cost_model.commission_per_trade,
     )
+
+    quote_ccy = quote_currency(instrument)
+    exit_times = times[exit_idx]
+    if quote_ccy == account_currency:
+        conversion_rate = np.ones(len(exit_idx))
+    elif fx is not None:
+        conversion_rate = fx.rate_to_account_currency(quote_ccy, exit_times)
+    else:
+        raise ValueError(
+            f"{instrument} is quoted in {quote_ccy}, which differs from "
+            f"account_currency={account_currency!r} -- pass an FxConverter via `fx`."
+        )
+    pnl_account_ccy = pnl * conversion_rate
+    # Risk was locked in at entry, but it's converted at the same exit-time rate as
+    # P&L (rather than the entry-time rate) purely for simplicity -- FX drift over a
+    # single trade's short holding period is negligible next to what it's measuring.
+    risk_account_ccy = risk * conversion_rate
 
     trades: list[Trade] = []
     balance = starting_balance
     equity_times = []
     equity_values = []
     for k in range(len(entry_idx)):
-        balance += pnl[k]
+        balance += pnl_account_ccy[k]
         trades.append(
             Trade(
                 instrument=instrument,
@@ -206,7 +268,9 @@ def run_backtest(
                 exit_time=pd.Timestamp(times[exit_idx[k]]),
                 exit_price=float(exit_price[k]),
                 units=position_size_units,
-                pnl=float(pnl[k]),
+                pnl=float(pnl_account_ccy[k]),
+                pnl_quote_ccy=float(pnl[k]),
+                risk=float(risk_account_ccy[k]),
                 exit_reason=EXIT_REASONS[int(reason[k])],
             )
         )

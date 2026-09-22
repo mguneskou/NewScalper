@@ -18,6 +18,8 @@ import sys
 import time
 from pathlib import Path
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from scalper.backtest.costs import CostModel
@@ -29,10 +31,21 @@ from scalper.data.history import load_cached
 from scalper.data.storage import connect, save_backtest_run
 from scalper.strategies.bollinger_breakout import BollingerBreakoutStrategy
 from scalper.strategies.ema_cross import EmaCrossStrategy
+from scalper.strategies.opening_range_breakout import OpeningRangeBreakoutStrategy
 from scalper.strategies.rsi_reversion import RsiReversionStrategy
 
-STRATEGIES = [EmaCrossStrategy, RsiReversionStrategy, BollingerBreakoutStrategy]
+ALL_STRATEGIES = [EmaCrossStrategy, RsiReversionStrategy, BollingerBreakoutStrategy, OpeningRangeBreakoutStrategy]
 STARTING_BALANCE = 10_000.0
+
+
+def _clip_to_recent_years(df: pd.DataFrame, years: float) -> pd.DataFrame:
+    """Keeps only the most recent `years` of cached candles -- lets a run be
+    scoped shorter than the full cache without re-fetching or re-caching."""
+    if df.empty:
+        return df
+    times = pd.to_datetime(df["time"])
+    cutoff = times.max() - pd.DateOffset(days=round(years * 365))
+    return df.loc[times >= cutoff].reset_index(drop=True)
 
 
 def main() -> int:
@@ -41,6 +54,14 @@ def main() -> int:
         "--granularities", nargs="+", default=None,
         help="Override config/settings.yaml granularities, e.g. --granularities M5",
     )
+    parser.add_argument(
+        "--strategies", nargs="+", default=None,
+        help="Override which strategies to run, by name, e.g. --strategies rsi_reversion bollinger_breakout",
+    )
+    parser.add_argument(
+        "--years", type=float, default=None,
+        help="Only use the most recent N years of cached data (default: settings.yaml backtest.years)",
+    )
     parser.add_argument("--max-workers", type=int, default=None)
     args = parser.parse_args()
 
@@ -48,6 +69,16 @@ def main() -> int:
     instruments = settings["instruments"]
     granularities = args.granularities or settings["granularities"]
     bt_cfg = settings["backtest"]
+    account_currency = settings["account_currency"]
+    years = args.years if args.years is not None else bt_cfg["years"]
+
+    strategies = ALL_STRATEGIES
+    if args.strategies:
+        wanted = set(args.strategies)
+        strategies = [s for s in ALL_STRATEGIES if s.name in wanted]
+        missing = wanted - {s.name for s in strategies}
+        if missing:
+            raise SystemExit(f"Unknown --strategies: {sorted(missing)}")
 
     # max_concurrent_positions is a live-trading portfolio control, not meaningful
     # for this single-instrument, single-position-at-a-time backtest engine.
@@ -63,16 +94,17 @@ def main() -> int:
         (strategy_cls, instrument, granularity)
         for instrument in instruments
         for granularity in granularities
-        for strategy_cls in STRATEGIES
+        for strategy_cls in strategies
         if not load_cached(instrument, granularity).empty
     ]
     total_jobs = len(jobs)
     run_start = time.time()
     summary_rows = []
+    print(f"account_currency={account_currency} years={years}", flush=True)
 
     with connect() as conn:
         for job_index, (strategy_cls, instrument, granularity) in enumerate(jobs, start=1):
-            df = load_cached(instrument, granularity)
+            df = _clip_to_recent_years(load_cached(instrument, granularity), years)
             strategy = strategy_cls()
             print(
                 f"[job {job_index}/{total_jobs}] {strategy.name} on {instrument} {granularity} "
@@ -95,6 +127,7 @@ def main() -> int:
                     validate_start=str(window_result.validate_start),
                     validate_end=str(window_result.validate_end),
                     is_out_of_sample=True,
+                    account_currency=account_currency,
                     metrics=window_result.validate_metrics,
                     trades=window_result.validate_trades,
                 )
@@ -118,6 +151,8 @@ def main() -> int:
                 validate_months=bt_cfg["validate_months"],
                 max_workers=args.max_workers,
                 on_window_done=on_window_done,
+                account_currency=account_currency,
+                granularity=granularity,
             )
             if not window_results:
                 print("  not enough data for even one walk-forward window, skipping", flush=True)
@@ -145,9 +180,9 @@ def main() -> int:
             )
             summary_rows.append((strategy.name, instrument, granularity, oos_metrics))
 
-    print("\n=== Out-of-sample summary (best to worst by total P&L) ===", flush=True)
+    print(f"\n=== Out-of-sample summary (best to worst by total P&L, in {account_currency}) ===", flush=True)
     summary_rows.sort(key=lambda r: r[3].total_pnl, reverse=True)
-    header = f"{'strategy':20s} {'instrument':10s} {'gran':4s} {'trades':>7s} {'win%':>6s} {'pf':>6s} {'pnl':>10s} {'sharpe':>7s} {'max_dd':>10s}"
+    header = f"{'strategy':20s} {'instrument':10s} {'gran':4s} {'trades':>7s} {'win%':>6s} {'pf':>6s} {'pnl_' + account_currency:>10s} {'sharpe':>7s} {'max_dd':>10s}"
     print(header, flush=True)
     for name, instrument, granularity, m in summary_rows:
         print(

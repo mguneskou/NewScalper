@@ -17,13 +17,13 @@ def make_result() -> BacktestResult:
             instrument="EUR_USD", direction=1,
             entry_time=pd.Timestamp("2026-01-01T00:00:00Z"), entry_price=1.1000,
             exit_time=pd.Timestamp("2026-01-01T01:00:00Z"), exit_price=1.1010,
-            units=1000, pnl=10.0, exit_reason="signal",
+            units=1000, pnl=10.0, pnl_quote_ccy=10.0, risk=5.0, exit_reason="signal",
         ),
         Trade(
             instrument="EUR_USD", direction=-1,
             entry_time=pd.Timestamp("2026-01-02T00:00:00Z"), entry_price=1.1010,
             exit_time=pd.Timestamp("2026-01-02T01:00:00Z"), exit_price=1.1000,
-            units=1000, pnl=10.0, exit_reason="take_profit",
+            units=1000, pnl=10.0, pnl_quote_ccy=10.0, risk=5.0, exit_reason="take_profit",
         ),
     ]
     equity = pd.Series([1010.0, 1020.0], index=pd.DatetimeIndex([t.exit_time for t in trades]))
@@ -48,6 +48,7 @@ def test_save_and_read_back_backtest_run():
                 validate_start="2025-07-01",
                 validate_end="2025-09-01",
                 is_out_of_sample=True,
+                account_currency="USD",
                 metrics=metrics,
                 trades=result.trades,
             )
@@ -83,6 +84,7 @@ def test_multiple_runs_accumulate_independently():
                     params={},
                     train_start=None, train_end=None, validate_start=None, validate_end=None,
                     is_out_of_sample=True,
+                    account_currency="USD",
                     metrics=metrics,
                     trades=result.trades,
                 )

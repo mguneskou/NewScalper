@@ -20,6 +20,7 @@ class Metrics:
     max_drawdown: float
     max_drawdown_pct: float
     sharpe_ratio: float
+    avg_r_multiple: float
     ending_balance: float
 
 
@@ -37,6 +38,7 @@ def compute_metrics(result: BacktestResult) -> Metrics:
             max_drawdown=0.0,
             max_drawdown_pct=0.0,
             sharpe_ratio=0.0,
+            avg_r_multiple=0.0,
             ending_balance=result.starting_balance,
         )
 
@@ -50,6 +52,12 @@ def compute_metrics(result: BacktestResult) -> Metrics:
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf") if gross_profit > 0 else 0.0
     total_pnl = pnls.sum()
     expectancy = pnls.mean()
+    # Mean P&L expressed as a multiple of what each trade risked at entry -- unlike
+    # total_pnl/expectancy, this is comparable across combos with different stop
+    # distances (fixed-pip or ATR-relative) regardless of position size, since a
+    # tight-stop combo's trades are scored against their own (smaller) risk rather
+    # than looking artificially cheap-and-plentiful next to a wide-stop combo's.
+    avg_r_multiple = float(np.mean([t.r_multiple for t in trades]))
 
     equity = pd.concat(
         [pd.Series([result.starting_balance]), result.equity_curve.reset_index(drop=True)]
@@ -78,5 +86,6 @@ def compute_metrics(result: BacktestResult) -> Metrics:
         max_drawdown=max_drawdown,
         max_drawdown_pct=max_drawdown_pct,
         sharpe_ratio=sharpe,
+        avg_r_multiple=avg_r_multiple,
         ending_balance=result.starting_balance + float(total_pnl),
     )

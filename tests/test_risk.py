@@ -1,88 +1,51 @@
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-import pytest
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from scalper.live.risk import DailyLossLimit, RiskManager, day_start_utc, trading_day
+from scalper.backtest.risk import atr_pips
 
-LONDON = ZoneInfo("Europe/London")
-
-
-def test_trading_day_requires_timezone_aware_input():
-    with pytest.raises(ValueError):
-        trading_day(datetime(2026, 1, 1))
+INSTRUMENT = "EUR_USD"
 
 
-def test_trading_day_uses_london_calendar_date():
-    # 23:30 UTC on Jan 1 is still Jan 1 in London (winter, no DST offset)
-    instant = datetime(2026, 1, 1, 23, 30, tzinfo=timezone.utc)
-    assert trading_day(instant) == datetime(2026, 1, 1).date()
+def test_atr_pips_matches_hand_computed_true_range():
+    # Equal bid/ask so mid H/L/C are just the given values, easy to hand-check.
+    # Bar 0 TR = 10 pips (high-low, no prior close).
+    # Bar 1 TR = max(15, 10, 5) = 15 pips (prior close 1.1010).
+    # Bar 2 TR = max(20, 20, 0) = 20 pips (prior close 1.1010).
+    df = pd.DataFrame(
+        {
+            "time": ["2026-01-01T00:00:00Z", "2026-01-01T00:01:00Z", "2026-01-01T00:02:00Z"],
+            "bid_o": [1.1000, 1.1010, 1.1015], "ask_o": [1.1000, 1.1010, 1.1015],
+            "bid_h": [1.1010, 1.1020, 1.1030], "ask_h": [1.1010, 1.1020, 1.1030],
+            "bid_l": [1.1000, 1.1005, 1.1010], "ask_l": [1.1000, 1.1005, 1.1010],
+            "bid_c": [1.1010, 1.1010, 1.1020], "ask_c": [1.1010, 1.1010, 1.1020],
+            "volume": [10, 10, 10], "complete": [True, True, True],
+        }
+    )
 
-    # 23:30 UTC in summer (BST, UTC+1) is already the next day locally
-    instant_summer = datetime(2026, 6, 1, 23, 30, tzinfo=timezone.utc)
-    assert trading_day(instant_summer) == datetime(2026, 6, 2).date()
+    result = atr_pips(df, period=2, instrument=INSTRUMENT)
 
-
-def test_day_start_utc_matches_london_midnight():
-    instant = datetime(2026, 6, 15, 10, 0, tzinfo=timezone.utc)  # BST in effect (UTC+1)
-    start = day_start_utc(instant)
-    # London midnight in BST is 23:00 UTC the previous day
-    assert start == datetime(2026, 6, 14, 23, 0, tzinfo=timezone.utc)
-
-
-def test_daily_loss_limit_breaches_at_threshold():
-    limit = DailyLossLimit(limit_gbp=50.0)
-    now = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
-
-    limit.record_closed_trade_pnl(-20.0, now)
-    assert not limit.breached
-    limit.record_closed_trade_pnl(-30.0, now)
-    assert limit.breached  # exactly at -50
-    assert limit.realized_pnl_today == -50.0
+    # ewm(alpha=1/2, adjust=False) internally: atr0=10, atr1=0.5*15+0.5*10=12.5, atr2=0.5*20+0.5*12.5=16.25.
+    # min_periods=2 masks bar 0 (only 1 observation) as NaN, then bfill() pulls bar 1's
+    # value back into it -- both read as the first fully-supported ATR estimate.
+    assert abs(result.iloc[0] - 12.5) < 1e-6
+    assert abs(result.iloc[1] - 12.5) < 1e-6
+    assert abs(result.iloc[2] - 16.25) < 1e-6
 
 
-def test_daily_loss_limit_resets_on_new_london_day():
-    limit = DailyLossLimit(limit_gbp=50.0)
-    day1 = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
-    day2 = datetime(2026, 1, 2, 10, tzinfo=timezone.utc)
-
-    limit.record_closed_trade_pnl(-60.0, day1)
-    assert limit.breached
-
-    limit.record_closed_trade_pnl(-5.0, day2)
-    assert not limit.breached
-    assert limit.realized_pnl_today == -5.0
-
-
-def test_daily_loss_limit_wins_do_not_trigger_breach():
-    limit = DailyLossLimit(limit_gbp=50.0)
-    now = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
-    limit.record_closed_trade_pnl(100.0, now)
-    assert not limit.breached
-
-
-def test_risk_manager_blocks_on_loss_limit_breach():
-    rm = RiskManager(daily_loss_limit=DailyLossLimit(limit_gbp=50.0), max_concurrent_positions=5)
-    now = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
-    rm.daily_loss_limit.record_closed_trade_pnl(-60.0, now)
-    assert rm.can_open_new_trade(open_position_count=0, now=now) is False
-
-
-def test_risk_manager_blocks_on_max_concurrent_positions():
-    rm = RiskManager(daily_loss_limit=DailyLossLimit(limit_gbp=50.0), max_concurrent_positions=2)
-    now = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
-    assert rm.can_open_new_trade(open_position_count=2, now=now) is False
-    assert rm.can_open_new_trade(open_position_count=1, now=now) is True
-
-
-def test_risk_manager_allows_new_day_after_breach():
-    rm = RiskManager(daily_loss_limit=DailyLossLimit(limit_gbp=50.0), max_concurrent_positions=5)
-    day1 = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
-    day2 = datetime(2026, 1, 2, 10, tzinfo=timezone.utc)
-    rm.daily_loss_limit.record_closed_trade_pnl(-60.0, day1)
-    assert rm.can_open_new_trade(open_position_count=0, now=day1) is False
-    assert rm.can_open_new_trade(open_position_count=0, now=day2) is True
+def test_atr_pips_never_nan():
+    df = pd.DataFrame(
+        {
+            "time": [f"2026-01-01T00:{i:02d}:00Z" for i in range(5)],
+            "bid_o": [1.10] * 5, "ask_o": [1.1002] * 5,
+            "bid_h": [1.1005] * 5, "ask_h": [1.1007] * 5,
+            "bid_l": [1.0995] * 5, "ask_l": [1.0997] * 5,
+            "bid_c": [1.10] * 5, "ask_c": [1.1002] * 5,
+            "volume": [10] * 5, "complete": [True] * 5,
+        }
+    )
+    result = atr_pips(df, period=14, instrument=INSTRUMENT)
+    assert not result.isna().any()

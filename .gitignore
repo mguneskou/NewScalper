@@ -19,3 +19,7 @@ dist/
 # Machine-specific desktop shortcut (hardcoded absolute local path).
 *.lnk
 
+# Raw stdout captures from ad-hoc backtest sweep runs -- debugging scratch,
+# not permanent artifacts (findings get written up in SESSION_NOTES.md instead).
+logs_*.txt
+

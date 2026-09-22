@@ -12,7 +12,7 @@ from scalper.backtest.metrics import compute_metrics
 STARTING_BALANCE = 1000.0
 
 
-def make_trade(pnl: float, exit_time: str) -> Trade:
+def make_trade(pnl: float, exit_time: str, risk: float = 20.0) -> Trade:
     return Trade(
         instrument="EUR_USD",
         direction=1,
@@ -22,6 +22,8 @@ def make_trade(pnl: float, exit_time: str) -> Trade:
         exit_price=1.1010,
         units=1000,
         pnl=pnl,
+        pnl_quote_ccy=pnl,
+        risk=risk,
         exit_reason="signal",
     )
 
@@ -47,6 +49,7 @@ def test_empty_trades_gives_zeroed_metrics():
     assert m.total_pnl == 0.0
     assert m.max_drawdown == 0.0
     assert m.sharpe_ratio == 0.0
+    assert m.avg_r_multiple == 0.0
     assert m.ending_balance == STARTING_BALANCE
 
 
@@ -100,3 +103,26 @@ def test_all_losses_gives_zero_win_rate_and_profit_factor():
     assert m.win_rate == 0.0
     assert m.profit_factor == 0.0
     assert abs(m.total_pnl - (-60)) < 1e-9
+
+
+def test_avg_r_multiple_normalizes_by_each_trade_own_risk():
+    # trade 1 risked 10 and made 20 -> +2R; trade 2 risked 40 and lost 20 -> -0.5R.
+    trades = [
+        make_trade(pnl=20, exit_time="2026-01-01T12:00:00Z", risk=10.0),
+        make_trade(pnl=-20, exit_time="2026-01-02T12:00:00Z", risk=40.0),
+    ]
+    assert abs(trades[0].r_multiple - 2.0) < 1e-9
+    assert abs(trades[1].r_multiple - (-0.5)) < 1e-9
+
+    balance = STARTING_BALANCE
+    values, times = [], []
+    for t in trades:
+        balance += t.pnl
+        values.append(balance)
+        times.append(t.exit_time)
+    result = BacktestResult(
+        trades=trades, equity_curve=pd.Series(values, index=pd.DatetimeIndex(times)),
+        starting_balance=STARTING_BALANCE,
+    )
+    m = compute_metrics(result)
+    assert abs(m.avg_r_multiple - 0.75) < 1e-9  # mean(2.0, -0.5)

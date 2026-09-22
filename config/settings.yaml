@@ -1,5 +1,11 @@
 # Non-secret app configuration. Secrets (API token, account ID) live in .env.
 
+# All backtest P&L is converted to this currency (via FX rates from the cached
+# candle data themselves) before being reported or compared -- required because
+# instruments are quoted in different currencies (e.g. USD_JPY's raw P&L is in
+# JPY, EUR_USD's in USD) and raw figures are not directly comparable.
+account_currency: GBP
+
 instruments:
   - EUR_USD
   - GBP_USD
@@ -22,7 +28,13 @@ backtest:
   commission_per_trade: 0.0
 
 risk_search:
-  stop_loss_pips: [3, 5, 8, 10, 15]
+  # Wide end extended repeatedly (15 -> 40 -> 80) as every risk-sizing experiment
+  # run so far (fixed-pip grids, ATR-relative multipliers, ORB's box-relative
+  # sizing, ORB's manual 1-year tuning pass) kept picking the widest stop-loss
+  # offered and still improving right up to the old boundary. The tight end (3,
+  # 5, 10) is dropped -- it has not won a single walk-forward window across any
+  # of those experiments, so keeping it only spends compute on combos that lose.
+  stop_loss_pips: [15, 25, 40, 60, 80]
   take_profit_pips: [5, 8, 10, 15, 20]
   # Fixed, not searched: with zero commission, P&L scales linearly with size, so it
   # never changes which SL/TP combo wins -- sizing is a live money-management
