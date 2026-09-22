@@ -102,6 +102,7 @@ class OandaClient:
         from_time_iso: str,
         count: int = MAX_CANDLES_PER_REQUEST,
         price: str = "BA",  # Bid + Ask, needed for realistic backtest fills
+        include_first: bool = True,
     ) -> list[dict]:
         data = self._request(
             "GET",
@@ -111,6 +112,7 @@ class OandaClient:
                 "from": from_time_iso,
                 "count": count,
                 "price": price,
+                "includeFirst": "true" if include_first else "false",
             },
         )
         return data["candles"]
@@ -123,11 +125,20 @@ class OandaClient:
         to_time_iso: str,
         price: str = "BA",
     ) -> Iterator[dict]:
-        """Pages through candles between two RFC3339 timestamps, yielding each candle."""
+        """Pages through candles between two RFC3339 timestamps, yielding each candle.
+
+        Oanda's `from` param is inclusive, so re-querying with `cursor = last_time`
+        of the previous page would re-yield that last candle as the first candle
+        of the next page. `includeFirst=false` on every page after the first
+        suppresses that re-fetch instead of relying on dedup downstream.
+        """
         cursor = from_time_iso
+        include_first = True
         seen_last_time: str | None = None
         while True:
-            batch = self.candles_page(instrument, granularity, cursor, price=price)
+            batch = self.candles_page(
+                instrument, granularity, cursor, price=price, include_first=include_first
+            )
             if not batch:
                 return
             for candle in batch:
@@ -139,6 +150,7 @@ class OandaClient:
                 return  # no progress -- avoid infinite loop
             seen_last_time = last_time
             cursor = last_time
+            include_first = False
             if len(batch) < MAX_CANDLES_PER_REQUEST:
                 return
 

@@ -108,9 +108,9 @@ def backfill(
     new_df = pd.DataFrame(new_rows, columns=CANDLE_COLUMNS)
     if not existing.empty:
         combined = pd.concat([existing, new_df], ignore_index=True)
-        combined = combined.drop_duplicates(subset="time", keep="last").sort_values("time")
     else:
-        combined = new_df.sort_values("time")
+        combined = new_df
+    combined = combined.drop_duplicates(subset="time", keep="last").sort_values("time")
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(cache_path(instrument, granularity), index=False)
