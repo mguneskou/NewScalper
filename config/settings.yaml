@@ -86,6 +86,21 @@ instrument_overrides:
     # SESSION_NOTES.md phase 6).
     strategy_params:
       direction_filter: ["short"]
+      # excluded_weekdays as a SEARCHED option (not forced), phase 9,
+      # 2026-09-24: unlike max_hold_bars/trailing_exit_pips/vol_filter_mode
+      # (all rejected below), this one showed a real, if mixed, effect. Piloted
+      # by letting the optimizer freely choose [] vs [4] (Friday) per window --
+      # 2026-07->09 and 2026-09 windows both chose [4] and improved
+      # substantially (PF 1.64->2.09, 1.04->1.90; combined stitched PF
+      # 1.53->2.04, pnl +46%, Sharpe 1.72->1.83), while an independent
+      # 2025-10->12 window chose [] (opted out) and got PF 0.84 -- weaker, but
+      # that's the window's natural OOS variance (phase 1 already saw
+      # 1.04-1.58 across windows on this exact instrument/granularity), not
+      # a cost of having the option: with the option available the optimizer
+      # never picked [4] when it didn't help in training. Kept as a genuine
+      # per-window search choice, not a blanket "always skip Friday" rule --
+      # same treatment as session_open_hour/box_minutes.
+      excluded_weekdays: [[], [4]]
   EUR_USD:
     # stop_loss_pips pinned to the max twice: 120 (run 1), then 150 after
     # widening to [60,80,100,120,150] (run 2) -- both times on M1 only

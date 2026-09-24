@@ -17,10 +17,23 @@ SESSION_TIMEZONE = "Europe/London"
 def _orb_positions(
     price: np.ndarray, box_high: np.ndarray, box_low: np.ndarray,
     exit_long_level: np.ndarray, exit_short_level: np.ndarray,
+    entry_mode: int, max_hold_bars: int, trailing_distance: float,
 ) -> np.ndarray:
+    """`entry_mode`: 0 = enter immediately on breakout (original behavior), 1 =
+    "retest" -- a breakout only arms entry, which then fires once price pulls
+    back to touch the broken level again (filters breakouts that never look
+    back, at the cost of missing ones that run away immediately).
+    `max_hold_bars` (0 = disabled) force-exits a position after this many bars
+    regardless of price. `trailing_distance` (0.0 = disabled, same price units
+    as `price`) exits once price gives back this much from the best price seen
+    since entry, ratcheting tighter as a winner runs -- independent of, and
+    checked in addition to, the box-mid exit level."""
     n = price.shape[0]
     out = np.empty(n, dtype=np.int64)
     position = 0
+    pending_dir = 0
+    bars_held = 0
+    favorable_price = 0.0
     for i in range(n):
         if np.isnan(box_high[i]) or np.isnan(box_low[i]):
             # No box yet for today (still forming, or before the session opens).
@@ -30,17 +43,64 @@ def _orb_positions(
             # exit once today's box became NaN-free again, instead of taking a
             # fresh breakout on today's own range.
             position = 0
+            pending_dir = 0
+            bars_held = 0
             out[i] = 0
             continue
         if position == 0:
-            if price[i] > box_high[i]:
-                position = 1
-            elif price[i] < box_low[i]:
-                position = -1
-        elif position == 1 and price[i] <= exit_long_level[i]:
-            position = 0
-        elif position == -1 and price[i] >= exit_short_level[i]:
-            position = 0
+            if entry_mode == 0:
+                if price[i] > box_high[i]:
+                    position = 1
+                elif price[i] < box_low[i]:
+                    position = -1
+            else:
+                # Arm on the initial break, fire once price comes back to
+                # (re)touch the broken level -- flips arm/re-arms if price
+                # breaks the opposite level first without ever retesting.
+                if pending_dir == 0:
+                    if price[i] > box_high[i]:
+                        pending_dir = 1
+                    elif price[i] < box_low[i]:
+                        pending_dir = -1
+                elif pending_dir == 1:
+                    if price[i] <= box_high[i]:
+                        position = 1
+                        pending_dir = 0
+                    elif price[i] < box_low[i]:
+                        pending_dir = -1
+                elif pending_dir == -1:
+                    if price[i] >= box_low[i]:
+                        position = -1
+                        pending_dir = 0
+                    elif price[i] > box_high[i]:
+                        pending_dir = 1
+            if position != 0:
+                bars_held = 0
+                favorable_price = price[i]
+        else:
+            bars_held += 1
+            if position == 1 and price[i] > favorable_price:
+                favorable_price = price[i]
+            elif position == -1 and price[i] < favorable_price:
+                favorable_price = price[i]
+
+            exited = False
+            if position == 1 and price[i] <= exit_long_level[i]:
+                position = 0
+                exited = True
+            elif position == -1 and price[i] >= exit_short_level[i]:
+                position = 0
+                exited = True
+
+            if not exited and max_hold_bars > 0 and bars_held >= max_hold_bars:
+                position = 0
+                exited = True
+
+            if not exited and trailing_distance > 0.0:
+                if position == 1 and price[i] <= favorable_price - trailing_distance:
+                    position = 0
+                elif position == -1 and price[i] >= favorable_price + trailing_distance:
+                    position = 0
         out[i] = position
     return out
 
@@ -78,6 +138,41 @@ def compute_box(df: pd.DataFrame, session_open_hour: int, box_minutes: int) -> t
     box_high = day_box_high.where(past_box_window)
     box_low = day_box_low.where(past_box_window)
     return box_high, box_low
+
+
+def _volatility_regime_mask(
+    df: pd.DataFrame, local_date: pd.Series, session_open_hour: int, box_minutes: int,
+    instrument: str, lookback_days: int, low_ratio: float, high_ratio: float,
+) -> pd.Series:
+    """True for days whose own box height is an outlier against the *trailing*
+    (not including today) rolling median of the last `lookback_days` days'
+    box heights for this instrument -- too small suggests a dead/holiday
+    session unlikely to produce a real breakout, too large suggests a news
+    spike whose range doesn't reflect normal intraday structure. Uses a fresh,
+    unfiltered box computation (independent of any min_box_height_pips masking
+    already applied by the caller) so the baseline isn't distorted by days
+    already excluded for other reasons. Trailing-only by construction (the
+    rolling window is shifted by one day) -- no look-ahead into today's own,
+    not-yet-fully-known-at-decision-time range."""
+    raw_high, raw_low = compute_box(df, session_open_hour, box_minutes)
+    height_pips = (raw_high - raw_low) / pip_size(instrument)
+    daily_heights = height_pips.groupby(local_date).max()
+    # Some calendar days have no box at all (a weekend sliver with too few
+    # bars to ever fill the box window -> NaN height), recurring roughly
+    # weekly. Left in place, a single one of these inside any lookback_days-
+    # sized window drops that window's valid-observation count below
+    # min_periods (== lookback_days), which -- since they recur more often
+    # than lookback_days apart -- makes EVERY window fail it, leaving the
+    # whole rolling baseline permanently NaN and this filter silently inert.
+    # Dropping them before rolling keeps the window built from real trading
+    # days only; they're already excluded from trading anyway (NaN box
+    # height means no breakout level to trade), so this doesn't change what
+    # happens on those days, only what the *other* days' baseline is built from.
+    valid_heights = daily_heights.dropna()
+    baseline = valid_heights.rolling(lookback_days, min_periods=lookback_days).median().shift(1)
+    ratio = valid_heights / baseline
+    bad_day = ((ratio < low_ratio) | (ratio > high_ratio)).reindex(daily_heights.index, fill_value=False)
+    return local_date.map(bad_day).fillna(False).astype(bool)
 
 
 class OpeningRangeBreakoutStrategy(Strategy):
@@ -147,6 +242,40 @@ class OpeningRangeBreakoutStrategy(Strategy):
         # SESSION_NOTES.md phase 6); enabled per-instrument via
         # instrument_overrides, not searched by default.
         "direction_filter": ["both"],
+        # "both" = trade every day of the week (default). A list/tuple of
+        # weekday ints (Monday=0..Sunday=6, pandas' Timestamp.weekday
+        # convention) excludes those days' boxes entirely -- e.g. Friday is a
+        # common FX heuristic (thinner liquidity, positions squared off before
+        # the weekend). Single default value here (not searched) since it
+        # needs real per-instrument evidence before widening, same as
+        # direction_filter/risk_mode; enabled via instrument_overrides.
+        "excluded_weekdays": [()],
+        # "off" (default) = every day trades regardless of recent volatility.
+        # "atr_ratio" = skip a day whose own box height is an outlier (below
+        # vol_low_ratio or above vol_high_ratio) against the trailing
+        # vol_lookback_days-day rolling median box height for this instrument
+        # -- see _volatility_regime_mask. Single default values for the three
+        # tuning knobs below too, for the same reason as excluded_weekdays.
+        "vol_filter_mode": ["off"],
+        "vol_lookback_days": [10],
+        "vol_low_ratio": [0.4],
+        "vol_high_ratio": [2.5],
+        # "breakout" (default) = enter immediately when price crosses the box
+        # edge. "retest" = arm on that break, only actually enter once price
+        # pulls back to touch the broken level again -- trades fewer, but
+        # (in principle) higher-conviction breakouts; see _orb_positions.
+        "entry_mode": ["breakout"],
+        # 0 (default, disabled) = no time-based exit. >0 force-exits a
+        # position after this many bars regardless of price -- caps how long
+        # a trade can sit open waiting for box_mid reversion or a stop/target
+        # that may never come on a quiet day.
+        "max_hold_bars": [0],
+        # 0.0 (default, disabled) = no trailing exit. >0 exits once price
+        # gives back this many pips from the best price seen since entry,
+        # independent of (checked in addition to) the box-mid exit and
+        # stop/take-profit -- lets a winner run further than a fixed
+        # take-profit while still locking in gains as it retraces.
+        "trailing_exit_pips": [0.0],
     }
 
     def risk_distances(
@@ -167,15 +296,35 @@ class OpeningRangeBreakoutStrategy(Strategy):
         box_high, box_low = compute_box(df, params["session_open_hour"], params["box_minutes"])
         exit_buffer_frac = params.get("exit_buffer_frac", 0.0)
         min_box_height_pips = params.get("min_box_height_pips", 0.0)
+        instrument = params.get("instrument")
 
         if min_box_height_pips > 0:
-            instrument = params.get("instrument")
             if instrument is None:
                 raise ValueError("min_box_height_pips > 0 requires 'instrument' in params")
             box_height_pips = (box_high - box_low) / pip_size(instrument)
             too_small = box_height_pips < min_box_height_pips
             box_high = box_high.where(~too_small)
             box_low = box_low.where(~too_small)
+
+        excluded_weekdays = params.get("excluded_weekdays", ())
+        if excluded_weekdays:
+            local_weekday = pd.to_datetime(df["time"]).dt.tz_convert(SESSION_TIMEZONE).dt.weekday
+            is_excluded_day = local_weekday.isin(excluded_weekdays)
+            box_high = box_high.where(~is_excluded_day)
+            box_low = box_low.where(~is_excluded_day)
+
+        if params.get("vol_filter_mode", "off") == "atr_ratio":
+            if instrument is None:
+                raise ValueError("vol_filter_mode='atr_ratio' requires 'instrument' in params")
+            local_date = pd.to_datetime(df["time"]).dt.tz_convert(SESSION_TIMEZONE).dt.date
+            bad_day = _volatility_regime_mask(
+                df, local_date, params["session_open_hour"], params["box_minutes"], instrument,
+                params.get("vol_lookback_days", 10),
+                params.get("vol_low_ratio", 0.4),
+                params.get("vol_high_ratio", 2.5),
+            )
+            box_high = box_high.where(~bad_day)
+            box_low = box_low.where(~bad_day)
 
         box_mid = (box_high + box_low) / 2.0
         box_height = box_high - box_low
@@ -195,11 +344,19 @@ class OpeningRangeBreakoutStrategy(Strategy):
         elif direction_filter == "short":
             entry_box_high = box_high.where(box_high.isna(), np.inf)
 
+        entry_mode = 1 if params.get("entry_mode", "breakout") == "retest" else 0
+        max_hold_bars = int(params.get("max_hold_bars", 0) or 0)
+        trailing_exit_pips = params.get("trailing_exit_pips", 0.0) or 0.0
+        if trailing_exit_pips and instrument is None:
+            raise ValueError("trailing_exit_pips > 0 requires 'instrument' in params")
+        trailing_distance = float(trailing_exit_pips) * pip_size(instrument) if trailing_exit_pips else 0.0
+
         sig_vals = _orb_positions(
             price.to_numpy(dtype=np.float64),
             entry_box_high.to_numpy(dtype=np.float64),
             entry_box_low.to_numpy(dtype=np.float64),
             exit_long_level.to_numpy(dtype=np.float64),
             exit_short_level.to_numpy(dtype=np.float64),
+            entry_mode, max_hold_bars, trailing_distance,
         )
         return pd.Series(sig_vals, index=df.index)

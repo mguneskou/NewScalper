@@ -122,3 +122,100 @@ def test_direction_filter_short_still_allows_short_entries_and_exits():
     assert sig.iloc[10] == -1  # 1.0990 < 1.1000 -> breaks out short
     assert sig.iloc[11] == -1
     assert sig.iloc[12] == 0  # 1.1005 >= mid(1.1005) -> reverts to flat
+
+
+def test_excluded_weekdays_skips_that_days_box():
+    # 2026-01-05 is a Monday (weekday=0).
+    day1_box = [1.1000, 1.1010, 1.1002, 1.1008, 1.1000]  # box_minutes=5 -> high=1.1010 low=1.1000
+    day1_rest = [1.1020] * (1440 - len(day1_box))  # would break out long if the box weren't excluded
+    df = make_orb_df(day1_box + day1_rest)
+    strat = OpeningRangeBreakoutStrategy()
+    sig = strat.signals(df, {"session_open_hour": 0, "box_minutes": 5, "excluded_weekdays": (0,)})
+    assert (sig == 0).all()
+
+
+def test_vol_filter_skips_abnormally_wide_box_day():
+    normal_box = [1.1000, 1.1010, 1.1002, 1.1008, 1.1000, 1.1005, 1.1001, 1.1009, 1.1003, 1.1006]
+    # box_minutes=10 -> high=1.1010 low=1.1000, height=10 pips
+    normal_day = normal_box + [1.1005] * (1440 - len(normal_box))  # rest of day flat at box_mid, no breakout
+    wide_box = [1.1000, 1.1100, 1.1000, 1.1050, 1.1000, 1.1050, 1.1000, 1.1050, 1.1000, 1.1050]
+    # high=1.1100 low=1.1000 -> height=100 pips, 10x the trailing baseline
+    breakout_after = [1.1150, 1.1200]  # breaks the (abnormally wide) box high
+
+    prices = normal_day * 6 + wide_box + breakout_after
+    df = make_orb_df(prices)
+    strat = OpeningRangeBreakoutStrategy()
+    params = {
+        "session_open_hour": 0, "box_minutes": 10, "instrument": "EUR_USD",
+        "vol_filter_mode": "atr_ratio", "vol_lookback_days": 5,
+    }
+    sig = strat.signals(df, params)
+    day7_start = 1440 * 6
+    assert (sig.iloc[day7_start:] == 0).all()  # abnormal box -> day skipped, breakout blocked
+
+
+def test_vol_filter_baseline_survives_a_nan_height_day():
+    # Regression test for a bug where a single NaN-height day (a day whose box
+    # window has no valid bars at all -- e.g. a weekend sliver) inside the
+    # rolling lookback window made the *entire* rolling baseline permanently
+    # NaN (min_periods == lookback_days means one NaN observation anywhere in
+    # a window drops it below the threshold), silently disabling the filter
+    # for the rest of history. The filter must still catch an abnormal day
+    # even when an earlier NaN-height day is inside its lookback window.
+    normal_box = [1.1000, 1.1010, 1.1002, 1.1008, 1.1000, 1.1005, 1.1001, 1.1009, 1.1003, 1.1006]
+    normal_day = normal_box + [1.1005] * (1440 - len(normal_box))
+    nan_day = [float("nan")] * 1440
+    wide_box = [1.1000, 1.1100, 1.1000, 1.1050, 1.1000, 1.1050, 1.1000, 1.1050, 1.1000, 1.1050]
+    breakout_after = [1.1150, 1.1200]
+
+    prices = normal_day * 4 + nan_day + normal_day * 2 + wide_box + breakout_after
+    df = make_orb_df(prices)
+    strat = OpeningRangeBreakoutStrategy()
+    params = {
+        "session_open_hour": 0, "box_minutes": 10, "instrument": "EUR_USD",
+        "vol_filter_mode": "atr_ratio", "vol_lookback_days": 5,
+    }
+    sig = strat.signals(df, params)
+    last_day_start = 1440 * 7
+    assert (sig.iloc[last_day_start:] == 0).all()  # still catches the abnormal day, baseline wasn't wiped out
+
+
+def test_entry_mode_retest_waits_for_pullback_before_entering():
+    box_prices = [1.1000, 1.1010, 1.1002, 1.1008, 1.1000, 1.1005, 1.1001, 1.1009, 1.1003, 1.1006]
+    # box high=1.1010, low=1.1000
+    prices_after = [1.1015, 1.1020, 1.1008, 1.1025]  # breaks out, runs, pulls back to retest, runs again
+    df = make_orb_df(box_prices + prices_after)
+    strat = OpeningRangeBreakoutStrategy()
+    sig = strat.signals(df, {"session_open_hour": 0, "box_minutes": 10, "entry_mode": "retest"})
+    assert sig.iloc[10] == 0  # breaks out but retest mode arms instead of entering
+    assert sig.iloc[11] == 0  # still running away, no retest yet
+    assert sig.iloc[12] == 1  # pulls back to 1.1008 <= box_high(1.1010) -> retest fires, enters long
+    assert sig.iloc[13] == 1
+
+
+def test_max_hold_bars_force_exits_after_n_bars():
+    box_prices = [1.1000, 1.1010, 1.1002, 1.1008, 1.1000, 1.1005, 1.1001, 1.1009, 1.1003, 1.1006]
+    # box high=1.1010, low=1.1000, mid=1.1005 -- price stays above mid, so box-mid exit never fires
+    prices_after = [1.1015, 1.1020, 1.1018, 1.1016]
+    df = make_orb_df(box_prices + prices_after)
+    strat = OpeningRangeBreakoutStrategy()
+    sig = strat.signals(df, {"session_open_hour": 0, "box_minutes": 10, "max_hold_bars": 2})
+    assert sig.iloc[10] == 1  # enters long
+    assert sig.iloc[11] == 1  # 1 bar held, still open
+    assert sig.iloc[12] == 0  # 2 bars held -> forced flat regardless of price
+    assert sig.iloc[13] == 1  # still above box_high -> immediately re-enters as a fresh trade
+
+
+def test_trailing_exit_pips_exits_on_giveback():
+    box_prices = [1.1000, 1.1010, 1.1002, 1.1008, 1.1000, 1.1005, 1.1001, 1.1009, 1.1003, 1.1006]
+    # box high=1.1010, low=1.1000, mid=1.1005
+    prices_after = [1.1015, 1.1040, 1.1025, 1.1020]
+    df = make_orb_df(box_prices + prices_after)
+    strat = OpeningRangeBreakoutStrategy()
+    params = {
+        "session_open_hour": 0, "box_minutes": 10, "instrument": "EUR_USD", "trailing_exit_pips": 10,
+    }
+    sig = strat.signals(df, params)
+    assert sig.iloc[10] == 1  # enters long at 1.1015 (favorable price so far)
+    assert sig.iloc[11] == 1  # 1.1040 -- new high, no giveback yet
+    assert sig.iloc[12] == 0  # 1.1025 gives back 15 pips from 1.1040 -> exceeds the 10-pip trail, exits

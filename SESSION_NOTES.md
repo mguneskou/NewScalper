@@ -589,3 +589,161 @@ plausibly erase, and the product of a walk-forward process that
 *re-optimizes periodically* rather than one fixed rule set — replicating it
 live would mean re-running the optimization on a schedule, not "set and
 forget."
+
+## Backlog items 7-11 (2026-09-24)
+
+Prior session (2026-09-22) committed and pushed as `f2bdd92` (phases 1-6:
+EUR_GBP drop, per-instrument grids, box_minutes, USD_JPY short-only). User
+then said "carry on with items 7-11" — the remaining ranked backlog:
+volatility regime filter, time-based/trailing exits, day-of-week filtering,
+alternative ORB variants, cross-instrument portfolio logic. Each piloted the
+same way as phases 2/4/6: add the new dimension to `OpeningRangeBreakoutStrategy`
+(default single value, so it doesn't change existing combo counts unless
+deliberately widened), pilot via a temporary `instrument_overrides.USD_JPY`
+grid widening (USD_JPY chosen as the most walk-forward-validated instrument,
+same reasoning as phase 5), decide keep/drop from real OOS results, revert
+the temp override if rejected. Pilot window: the same `--years 0.55
+--train-months 4 --validate-months 2` 6-month slice (2026-07-01 -> 2026-09-17,
+2 windows) used throughout the per-instrument tuning work, baseline =
+trades=68 pf=1.53 pnl=28.28 sharpe=1.72 max_dd=-9.81 (USD_JPY M5, current
+settings, no new dimension enabled).
+
+New `OpeningRangeBreakoutStrategy` params added for this (all default to a
+no-op single value in the base `param_grid`, see the code comments there):
+`excluded_weekdays`, `vol_filter_mode`/`vol_lookback_days`/`vol_low_ratio`/
+`vol_high_ratio`, `entry_mode`, `max_hold_bars`, `trailing_exit_pips`.
+`max_hold_bars`/`trailing_exit_pips` are implemented entirely inside
+`_orb_positions` (the numba signal loop), not the backtest engine -- keeps
+"strategy decides direction, engine decides execution timing" intact, and
+avoids threading two more dimensions through `optimizer.py`'s risk-grid
+machinery. Tests: `test_excluded_weekdays_skips_that_days_box`,
+`test_vol_filter_skips_abnormally_wide_box_day`,
+`test_vol_filter_baseline_survives_a_nan_height_day`,
+`test_entry_mode_retest_waits_for_pullback_before_entering`,
+`test_max_hold_bars_force_exits_after_n_bars`,
+`test_trailing_exit_pips_exits_on_giveback`.
+
+**Bug caught and fixed during phase 7**: `_volatility_regime_mask`'s rolling
+baseline (median box height over the trailing `vol_lookback_days` days) was
+*permanently* NaN on real data -- some calendar days (weekend slivers with too
+few bars to ever fill the box window) have a NaN box height, recurring
+roughly weekly. `rolling(lookback_days, min_periods=lookback_days)` requires
+zero NaNs in a `lookback_days`-sized window to produce a value; since these
+NaN days recur more often than `lookback_days` apart, *every* window failed
+the count, silently disabling the whole filter (confirmed: first pilot run's
+result was byte-identical to baseline). Fixed by dropping NaN-height days
+before rolling (`_volatility_regime_mask`, `valid_heights = daily_heights.dropna()`)
+-- those days are already excluded from trading anyway via NaN box
+high/low, so this only changes what the *other* days' baseline is built
+from. `test_vol_filter_baseline_survives_a_nan_height_day` regression-tests
+this specifically (the earlier vol-filter test used only fully-formed days
+and would not have caught it).
+
+### Phase 7: volatility regime filter -- REJECTED
+
+After the NaN-baseline fix, forced `vol_filter_mode=atr_ratio` (default
+`vol_lookback_days=10`, `vol_low_ratio=0.4`, `vol_high_ratio=2.5`) on USD_JPY
+M5 and re-ran the pilot window: trades 68->51 (-25%), pnl 28.28->20.47
+(-28%), sharpe 1.72->1.29, max_dd -9.81->-12.04 (worse). PF barely moved
+(1.53->1.54). Filtering out "abnormal" days cut volume and hurt risk-adjusted
+return with no offsetting benefit -- rejected, override reverted.
+
+### Phase 8: time-based / trailing exits -- REJECTED (both)
+
+Piloted as searched options (grid `[0, 24, 48, 96]` bars and `[0.0, 10.0,
+20.0, 40.0]` pips respectively, 0/0.0 = disabled, included specifically so
+the optimizer could reject them) rather than forced values, letting training
+choose per window like `session_open_hour`. Both pilots came back **byte-
+identical to baseline** (same 68 trades, same PF 1.53, same £28.28) --
+the optimizer never once chose a non-zero value in either walk-forward
+window. Strongest possible rejection signal available from this method:
+given the choice, training itself never wanted either feature. Box-mid
+reversion + the existing fixed SL/TP already dominates every time/trailing
+variant tried for USD_JPY M5. Both overrides reverted (never landed
+permanently since they were tested as temporary grid widenings only).
+
+### Phase 9: day-of-week filtering -- KEPT (as a searched option, USD_JPY only)
+
+Piloted `excluded_weekdays: [[], [4]]` (Friday) as a searched option, same
+method as phase 8. Unlike phase 8, this showed a real effect: both windows
+in the pilot slice chose `[4]` in training and improved substantially OOS
+(window 1 PF 1.64->2.09 pnl 27.88->30.71, window 2 PF 1.04->1.90 pnl
+0.40->10.65; combined stitched PF 1.53->2.04, pnl 28.28->41.35 (+46%),
+sharpe 1.72->1.83, though max_dd worsened -9.81->-14.02).
+
+**Second-window check (independent, non-overlapping) before trusting it**:
+`--start 2025-06-01 --end 2025-12-01` (validate window 2025-10-01 ->
+2025-11-30) -- training chose `excluded_weekdays=[]` (opted out) and got PF
+0.84 OOS. At first glance a regression, but the optimizer had the *same*
+choice available as the other two windows and didn't use `[4]` here --
+meaning this window's weak result reflects that window's OOS conditions
+generally (consistent with phase 1's original finding that USD_JPY M5 varies
+PF 1.04-1.58 across windows), not a cost imposed by having the option. With
+the dimension available, training only ever uses it when it actually helps
+in-sample; it never made a window *worse* by forcing an unwanted filter.
+
+**Decision: kept as a permanent, searched (not forced) `instrument_overrides.USD_JPY`
+entry** -- same treatment as `session_open_hour`/`box_minutes`, not a
+blanket "always skip Friday" rule. Not tried for EUR_USD/GBP_USD this pass.
+
+### Phase 10: alternative ORB variants -- retest entries REJECTED, multiple boxes/day not attempted
+
+Implemented `entry_mode="retest"` in `_orb_positions`: a breakout only arms
+entry, which fires once price pulls back to (re)touch the broken level
+(state machine: `pending_dir`, see the function's docstring). Scoped to this
+one variant for phase 10 -- "multiple boxes/day" (e.g. a second London+NY
+box) was not attempted this pass, left for a future session.
+
+Piloted as a searched option (`entry_mode: ["breakout", "retest"]`) same
+method as phases 8/9. Window 1 chose `retest` in training and it collapsed
+OOS: PF 2.09->1.37, pnl 30.71->3.18, trades 39->19. Window 2 didn't use it
+(picked `breakout`, unchanged). Combined stitched result worse than without
+it (PF 2.04->1.68, pnl 41.35->13.83). Same overfit-to-training-noise
+signature as phase 3's rejected grid widening -- the dimension gave the
+optimizer a way to fit window 1's training noise that didn't generalize.
+**Rejected, override reverted.** `entry_mode`/`_orb_positions`' retest state
+machine kept as infrastructure (harmless at default "breakout"), same
+treatment as phase 5's `risk_mode`/`risk_distances`.
+
+### Phase 11: cross-instrument portfolio logic -- scoped down, naive combination REJECTED
+
+The real single-instrument backtest engine (`run_backtest`/`_simulate`) has
+no concept of shared capital or simultaneous multi-instrument positions --
+`max_concurrent_positions` in `risk_search` is explicitly documented as a
+live-only knob the backtest doesn't model. Building an actual shared-capital,
+concurrent-position portfolio engine was out of scope for this pass; instead
+ran a scoped diagnostic: combined the three instruments' independently-
+computed OOS trade streams (same pilot window, same run, fresh
+`--skip-active-params` run of all three: USD_JPY pf=2.04 pnl=41.35,
+GBP_USD pf=1.09 pnl=9.11, EUR_USD pf=0.80 pnl=-8.96) into one shared,
+sequential equity curve (ad-hoc script, not committed -- see chat), as if
+one account traded all three with the current per-instrument params and no
+allocation weighting.
+
+Result: **naive equal-weight combination does not help**.
+USD_JPY+GBP_USD: pnl 50.46 (higher, since GBP_USD is mildly positive) but
+sharpe roughly flat (1.83->1.80) and max_dd roughly doubles (-14.02->-32.05).
+USD_JPY+EUR_USD: pnl drops to 32.39, sharpe drops to 1.23, max_dd worsens to
+-19.91 (EUR_USD's negative edge just drags on the good instrument). All
+three combined: pnl 41.50 (GBP_USD's gain and EUR_USD's loss roughly cancel,
+netting out near USD_JPY alone), sharpe drops to 1.36, max_dd worsens to
+-44.90 (>3x USD_JPY alone). Blending a strong, validated edge (USD_JPY) with
+weaker/negative ones at equal position size dilutes risk-adjusted return
+without a compensating diversification benefit in this window -- there's no
+evidence here that trading all three together beats trading USD_JPY M5 alone.
+**Rejected as tested.** If portfolio logic is revisited, the lever most
+likely to matter is risk-weighted sizing (scale each instrument's position
+by its own edge strength, not a flat 1000 units each) rather than equal-
+weight blending, and it would need a real shared-capital engine change (not
+just this trade-stream-concatenation diagnostic) to be trustworthy.
+
+## Status after phases 7-11
+
+Net effect of this pass: one durable addition (`excluded_weekdays` as a
+searched USD_JPY option, phase 9), everything else rejected after real
+testing (not skipped). `active_params` was **not** touched this pass (every
+run used `--skip-active-params`) -- it still reflects the 2026-09-22
+phase-6 end state. A full walk-forward re-run (without `--skip-active-params`)
+to let `excluded_weekdays` actually reach `active_params`, and to re-validate
+phase 9 across the full 5yr multi-window history rather than just the 2
+pilot windows checked here, is a natural next step.
