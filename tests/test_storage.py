@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from scalper.backtest.engine import BacktestResult, Trade
 from scalper.backtest.metrics import compute_metrics
-from scalper.data.storage import connect, save_backtest_run
+from scalper.data.storage import connect, get_active_params, save_active_params, save_backtest_run
 
 
 def make_result() -> BacktestResult:
@@ -95,3 +95,59 @@ def test_multiple_runs_accumulate_independently():
 
         assert count == 2
         assert trade_count == 4
+
+
+def test_active_params_round_trip():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "test.db"
+        metrics = compute_metrics(make_result())
+
+        with connect(db_path) as conn:
+            assert get_active_params(
+                conn, strategy_name="opening_range_breakout", instrument="USD_JPY", granularity="M5"
+            ) is None
+
+            save_active_params(
+                conn,
+                strategy_name="opening_range_breakout",
+                instrument="USD_JPY",
+                granularity="M5",
+                params={"stop_loss_pips": 80, "take_profit_pips": 20},
+                train_start="2025-01-01", train_end="2025-05-01",
+                validate_start="2025-05-01", validate_end="2025-07-01",
+                metrics=metrics,
+            )
+
+        with connect(db_path) as conn:
+            params = get_active_params(
+                conn, strategy_name="opening_range_breakout", instrument="USD_JPY", granularity="M5"
+            )
+        assert params == {"stop_loss_pips": 80, "take_profit_pips": 20}
+
+
+def test_active_params_overwrite_on_re_tune():
+    """A second save for the same (strategy, instrument, granularity) replaces
+    the first rather than accumulating -- this is what makes it "evolving"
+    instead of a permanent, named, set-and-forget config."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "test.db"
+        metrics = compute_metrics(make_result())
+        key = dict(strategy_name="opening_range_breakout", instrument="USD_JPY", granularity="M5")
+
+        with connect(db_path) as conn:
+            save_active_params(
+                conn, **key, params={"stop_loss_pips": 80, "take_profit_pips": 20},
+                train_start="2025-01-01", train_end="2025-05-01",
+                validate_start="2025-05-01", validate_end="2025-07-01", metrics=metrics,
+            )
+            save_active_params(
+                conn, **key, params={"stop_loss_pips": 60, "take_profit_pips": 15},
+                train_start="2025-05-01", train_end="2025-09-01",
+                validate_start="2025-09-01", validate_end="2025-11-01", metrics=metrics,
+            )
+
+            row_count = conn.execute("SELECT COUNT(*) FROM active_params").fetchone()[0]
+            params = get_active_params(conn, **key)
+
+        assert row_count == 1
+        assert params == {"stop_loss_pips": 60, "take_profit_pips": 15}

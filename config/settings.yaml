@@ -6,11 +6,15 @@
 # JPY, EUR_USD's in USD) and raw figures are not directly comparable.
 account_currency: GBP
 
+# EUR_GBP dropped 2026-09-22: once its trade-starvation problem was fixed
+# (see instrument_overrides history below / SESSION_NOTES.md), it turned out
+# to be a genuine loser for ORB (PF ~0.5, Sharpe -4.7 to -5.5 on a 2-month
+# OOS window), not just a filter artifact -- dropped rather than continuing
+# to chase it.
 instruments:
   - EUR_USD
   - GBP_USD
   - USD_JPY
-  - EUR_GBP
 
 granularities:
   - M1
@@ -28,14 +32,17 @@ backtest:
   commission_per_trade: 0.0
 
 risk_search:
-  # Wide end extended repeatedly (15 -> 40 -> 80) as every risk-sizing experiment
-  # run so far (fixed-pip grids, ATR-relative multipliers, ORB's box-relative
-  # sizing, ORB's manual 1-year tuning pass) kept picking the widest stop-loss
-  # offered and still improving right up to the old boundary. The tight end (3,
-  # 5, 10) is dropped -- it has not won a single walk-forward window across any
-  # of those experiments, so keeping it only spends compute on combos that lose.
-  stop_loss_pips: [15, 25, 40, 60, 80]
-  take_profit_pips: [5, 8, 10, 15, 20]
+  # Grid for opening_range_breakout, the only strategy left in this project
+  # (ema_cross/rsi_reversion/bollinger_breakout were tried and dropped as
+  # net-losing everywhere tested -- see SESSION_NOTES.md). Wide end extended
+  # repeatedly (15 -> 40 -> 80 -> 120) as every ORB walk-forward run kept
+  # picking the widest stop-loss offered (80 won 35/44 windows at the
+  # previous boundary) and still improving right up to it -- same for
+  # USD_JPY's take-profit (20 won 8/11 windows). The tight end (3, 5, 10) is
+  # dropped -- it never won a single window across any experiment, on ORB or
+  # the strategies that preceded it.
+  stop_loss_pips: [40, 60, 80, 100, 120]
+  take_profit_pips: [10, 15, 20, 25, 30]
   # Fixed, not searched: with zero commission, P&L scales linearly with size, so it
   # never changes which SL/TP combo wins -- sizing is a live money-management
   # decision layered on top, not part of the strategy's edge.
@@ -43,6 +50,68 @@ risk_search:
   # Not used by the single-instrument backtest engine (only one position at a time
   # per instrument is modeled); this is a live-trading portfolio control only.
   max_concurrent_positions: [1, 2, 3]
+
+# Per-instrument overrides, merged key-by-key on top of risk_search and the
+# strategy's own param_grid (see scripts/run_backtest.py's job loop and
+# optimizer.grid_search_train's `param_grid` argument). Different
+# instruments have shown different needs, not just different winners from
+# one shared grid -- see SESSION_NOTES.md for the evidence behind each entry
+# below. Only add an override once a shared-grid run shows a real problem
+# (boundary-pinning or a broken trade count); don't pre-emptively widen
+# every instrument's grid on spec.
+instrument_overrides:
+  USD_JPY:
+    # take_profit_pips pinned to the shared grid's max twice in a row:
+    # 30 (2026-09-22 run 1), then 50 after widening to [20,25,30,40,50]
+    # (run 2). Widened again -- if 120 pins too, stop doubling and treat
+    # ORB's box-relative exit as the real ceiling for USD_JPY instead.
+    #
+    # Box-relative sizing (risk_mode=box) WAS tried (phase 5, 2026-09-22,
+    # piloted here since USD_JPY is the most validated instrument) and
+    # rejected: PF dropped 1.29->0.86 (M5) and 1.04->0.85 (M1), trade count
+    # roughly tripled, P&L went negative on both -- the box-height-fraction
+    # stops (1.0-3.0x) were tighter than USD_JPY's real volatility needs,
+    # unlike the wide fixed-pip stops that keep winning here. risk_mode
+    # stays at the default "fixed" (see OpeningRangeBreakoutStrategy.param_grid).
+    risk_search:
+      take_profit_pips: [40, 50, 70, 90, 120]
+    # direction_filter=short, KEPT (phase 6, 2026-09-22): USD_JPY's short
+    # trades beat its long trades in every one of 3 independent walk-forward
+    # windows checked, on both M1 and M5 (long PF 0.51-1.02, short PF
+    # 0.99-1.66 -- short wins all 6 window x granularity combos). Piloted
+    # with --skip-active-params, then promoted: PF improved further once the
+    # optimizer was freed to search long-side params too, from 1.29->1.68
+    # (M5) and 1.04->1.34 (M1). Not tried for EUR_USD/GBP_USD -- their
+    # direction lean is much weaker and inconsistent across windows (see
+    # SESSION_NOTES.md phase 6).
+    strategy_params:
+      direction_filter: ["short"]
+  EUR_USD:
+    # stop_loss_pips pinned to the max twice: 120 (run 1), then 150 after
+    # widening to [60,80,100,120,150] (run 2) -- both times on M1 only
+    # (M5 picked 60, well inside the original range).
+    risk_search:
+      stop_loss_pips: [100, 150, 200, 250, 300]
+    # session_open_hour=0 (Asian session) + box_minutes=15 + min_box_height_pips=8.0
+    # produced ZERO validation-window trades on M5 (phase 4, 2026-09-22) --
+    # not thin, literally none. Same underlying issue as GBP_USD's Asian-
+    # session exclusion below: EUR_USD isn't actively traded during Tokyo
+    # hours, so a training-window combo built on that session doesn't
+    # transfer. Excluded for EUR_USD; kept for USD_JPY (its home session,
+    # and the only instrument where Asian-session picks have looked legitimate).
+    strategy_params:
+      session_open_hour: [8, 13]
+  GBP_USD:
+    # Same stop_loss_pips pinning as EUR_USD, also M1-only.
+    risk_search:
+      stop_loss_pips: [100, 150, 200, 250, 300]
+    # session_open_hour=0 (Asian session, added phase 2) picked a PF 2.55-2.77
+    # combo on only 11-17 validation trades -- the same trade-starvation
+    # overfitting trap as EUR_GBP's min_box_height_pips issue, not a real
+    # edge. Excluded back to the original two sessions for this instrument
+    # only; USD_JPY's Asian-session pick had a normal trade count and is kept.
+    strategy_params:
+      session_open_hour: [8, 13]
 
 live:
   # Day boundary for "today's closed positions" and the daily loss-limit reset.

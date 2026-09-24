@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
+import numpy as np
 import pandas as pd
 
 
@@ -23,3 +24,16 @@ class Strategy(ABC):
 
     def mid_close(self, df: pd.DataFrame) -> pd.Series:
         return (df["bid_c"] + df["ask_c"]) / 2.0
+
+    def risk_distances(
+        self, df: pd.DataFrame, params: dict, sl: float, tp: float
+    ) -> tuple[float | np.ndarray, float | np.ndarray]:
+        """Converts a risk-grid (sl, tp) pair into the actual pip distances
+        passed to `run_backtest`. Default: fixed pips, passed through
+        unchanged. A strategy can override this to interpret sl/tp
+        differently based on its own params -- e.g. as a fraction of a
+        self-computed range (a stop/target sized to what the market is
+        actually doing at entry, rather than one static pip count) -- in
+        which case the optimizer's risk_search grid values mean whatever
+        that strategy defines them to mean instead of pips."""
+        return sl, tp

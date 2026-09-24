@@ -89,19 +89,33 @@ class OpeningRangeBreakoutStrategy(Strategy):
 
     name = "opening_range_breakout"
     param_grid = {
-        # 8 ~= London session open, 13 ~= New York session open, both in the
-        # Europe/London local time used to build the box.
-        "session_open_hour": [8, 13],
-        # Locked at 30 (not searched): consistently the best of [15, 30, 60] across
-        # every manual tuning pass so far, by a clearer margin than session_open_hour.
-        "box_minutes": [30],
+        # 0 ~= Tokyo/Asian session open, 8 ~= London open, 13 ~= New York
+        # open, all in the Europe/London local time used to build the box
+        # (Tokyo's 9am JST is 00:00 London time in winter, 01:00 in summer --
+        # a year-round fixed London hour is an approximation, same caveat as
+        # for 8/13, consistent with the rest of the system's day-boundary
+        # convention rather than tracking each session's local DST exactly).
+        "session_open_hour": [0, 8, 13],
+        # 30 was consistently the best of [15, 30, 60] across every manual
+        # tuning pass so far (by a clearer margin than session_open_hour),
+        # but that was EUR_USD-only, pre-dating per-instrument tuning.
+        # Re-opened for search (phase 4, 2026-09-22) so each instrument can
+        # confirm or override it independently -- unlike phase 3's grid
+        # widening, this has real prior evidence behind the values, not a
+        # blind expansion, but the combo count still roughly triples, so
+        # watch for the same overfitting/trade-starvation signature.
+        "box_minutes": [15, 30, 60],
         # 0.0 = exit exactly at the box midpoint (original behavior). A positive
         # value pushes the exit trigger further past the midpoint, deeper into
         # the box (as a fraction of box height) -- requires more than a bare
         # touch before giving up, to cut down on whipsaw exits right at the line.
         # 0.4 was the best single value found manually; the neighbors are here so
         # the real walk-forward can pick per-instrument/per-window rather than
-        # trusting one manually-tuned window's exact peak.
+        # trusting one manually-tuned window's exact peak. Widened to
+        # [0.0, 0.15, 0.25, 0.4, 0.5] in phase 3 (2026-09-22) then reverted the
+        # same day: every instrument's OOS profit factor got worse and every
+        # one pinned to the new max (0.5) -- tripling the combo count let the
+        # optimizer fit training-window noise instead of finding real edge.
         "exit_buffer_frac": [0.0, 0.25, 0.4],
         # 0.0 = trade every day's box regardless of size. A positive value skips
         # days whose box is narrower than this many pips -- a very small opening
@@ -109,9 +123,45 @@ class OpeningRangeBreakoutStrategy(Strategy):
         # it correspondingly less likely to mean anything. 8 pips was the best
         # found manually (roughly EUR_USD's 25th-percentile box height); results
         # were bumpy enough between 7-10 pips that this is a rough answer, not
-        # a precisely-located optimum.
+        # a precisely-located optimum. Widened to [0.0, 4.0, 8.0, 12.0] in
+        # phase 3 (2026-09-22) then reverted the same day, same reason and
+        # same trade-starvation signature as exit_buffer_frac above.
         "min_box_height_pips": [0.0, 8.0],
+        # "fixed" = stop_loss_pips/take_profit_pips in the risk grid are pip
+        # counts (default, see `signals`' caller in run_backtest.py). "box"
+        # = they're fractions of that day's own box height instead -- a
+        # stop/target sized to what the market actually did that morning,
+        # rather than one static number (see `risk_distances`). Left at
+        # "fixed" here: box mode needs its own differently-scaled risk grid
+        # (a fraction like 1.5 means something totally different from a pip
+        # count like 60), so it's only ever run as a deliberate, separately
+        # configured experiment via instrument_overrides, never mixed into
+        # the default search.
+        "risk_mode": ["fixed"],
+        # "both" = trade every breakout regardless of direction (default).
+        # "long"/"short" restrict entries to one direction -- if an
+        # instrument's edge is direction-biased, trading the losing side
+        # only adds drag. Left at "both" here since only USD_JPY has shown a
+        # bias robust enough to act on (short beat long in all 3 independent
+        # walk-forward windows checked, on both granularities -- see
+        # SESSION_NOTES.md phase 6); enabled per-instrument via
+        # instrument_overrides, not searched by default.
+        "direction_filter": ["both"],
     }
+
+    def risk_distances(
+        self, df: pd.DataFrame, params: dict, sl: float, tp: float
+    ) -> tuple[float | np.ndarray, float | np.ndarray]:
+        if params.get("risk_mode", "fixed") != "box":
+            return sl, tp
+        box_high, box_low = compute_box(df, params["session_open_hour"], params["box_minutes"])
+        box_height_pips = (box_high - box_low) / pip_size(params["instrument"])
+        # Same bfill-then-zero hygiene as risk.py's old atr_pips() -- a
+        # still-forming/pre-box bar can never actually be a trade's entry bar
+        # (signals() is flat there), so this is never used for real, just
+        # keeps the array NaN-free.
+        box_height_pips = box_height_pips.bfill().fillna(0.0)
+        return (box_height_pips * sl).to_numpy(), (box_height_pips * tp).to_numpy()
 
     def signals(self, df: pd.DataFrame, params: dict) -> pd.Series:
         box_high, box_low = compute_box(df, params["session_open_hour"], params["box_minutes"])
@@ -133,10 +183,22 @@ class OpeningRangeBreakoutStrategy(Strategy):
         exit_short_level = box_mid + exit_buffer_frac * box_height
         price = self.mid_close(df)
 
+        # Blocks entries in the disallowed direction by pushing that side's
+        # breakout level unreachable, without touching box_mid/box_height
+        # above (still needed, unfiltered, for the *allowed* side's exit
+        # level) -- .where() only replaces the non-NaN bars so "no box yet"
+        # stays NaN and _orb_positions' reset-to-flat logic is unaffected.
+        entry_box_high, entry_box_low = box_high, box_low
+        direction_filter = params.get("direction_filter", "both")
+        if direction_filter == "long":
+            entry_box_low = box_low.where(box_low.isna(), -np.inf)
+        elif direction_filter == "short":
+            entry_box_high = box_high.where(box_high.isna(), np.inf)
+
         sig_vals = _orb_positions(
             price.to_numpy(dtype=np.float64),
-            box_high.to_numpy(dtype=np.float64),
-            box_low.to_numpy(dtype=np.float64),
+            entry_box_high.to_numpy(dtype=np.float64),
+            entry_box_low.to_numpy(dtype=np.float64),
             exit_long_level.to_numpy(dtype=np.float64),
             exit_short_level.to_numpy(dtype=np.float64),
         )

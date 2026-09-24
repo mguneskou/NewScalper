@@ -1,92 +1,12 @@
 import sys
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from scalper.strategies.bollinger_breakout import BollingerBreakoutStrategy
-from scalper.strategies.ema_cross import EmaCrossStrategy
 from scalper.strategies.opening_range_breakout import OpeningRangeBreakoutStrategy
-from scalper.strategies.rsi_reversion import RsiReversionStrategy
-
-
-def make_price_df(closes: list[float]) -> pd.DataFrame:
-    n = len(closes)
-    return pd.DataFrame(
-        {
-            "time": [f"2026-01-01T00:{i:02d}:00.000000000Z" for i in range(n)],
-            "bid_o": closes,
-            "bid_h": closes,
-            "bid_l": closes,
-            "bid_c": closes,
-            "ask_o": closes,
-            "ask_h": closes,
-            "ask_l": closes,
-            "ask_c": closes,
-            "volume": [1] * n,
-            "complete": [True] * n,
-        }
-    )
-
-
-def test_ema_cross_goes_long_in_uptrend():
-    closes = list(np.linspace(1.0, 1.1, 60))
-    df = make_price_df(closes)
-    strat = EmaCrossStrategy()
-    sig = strat.signals(df, {"fast_period": 5, "slow_period": 20})
-    assert sig.iloc[-1] == 1
-
-
-def test_ema_cross_goes_short_in_downtrend():
-    closes = list(np.linspace(1.1, 1.0, 60))
-    df = make_price_df(closes)
-    strat = EmaCrossStrategy()
-    sig = strat.signals(df, {"fast_period": 5, "slow_period": 20})
-    assert sig.iloc[-1] == -1
-
-
-def test_ema_cross_invalid_params_stays_flat():
-    closes = list(np.linspace(1.0, 1.1, 30))
-    df = make_price_df(closes)
-    strat = EmaCrossStrategy()
-    sig = strat.signals(df, {"fast_period": 20, "slow_period": 5})
-    assert (sig == 0).all()
-
-
-def test_rsi_reversion_goes_long_after_sharp_drop():
-    closes = [1.10] * 20 + list(np.linspace(1.10, 1.05, 15))  # sharp decline -> oversold
-    df = make_price_df(closes)
-    strat = RsiReversionStrategy()
-    sig = strat.signals(df, {"period": 14, "oversold": 30, "overbought": 70})
-    assert sig.iloc[-1] == 1
-
-
-def test_rsi_reversion_goes_short_after_sharp_rise():
-    closes = [1.05] * 20 + list(np.linspace(1.05, 1.10, 15))  # sharp rise -> overbought
-    df = make_price_df(closes)
-    strat = RsiReversionStrategy()
-    sig = strat.signals(df, {"period": 14, "oversold": 30, "overbought": 70})
-    assert sig.iloc[-1] == -1
-
-
-def test_bollinger_breakout_goes_long_on_upside_break():
-    flat = [1.10] * 25
-    spike = [1.10 + 0.001 * i for i in range(1, 6)]
-    closes = flat + spike
-    df = make_price_df(closes)
-    strat = BollingerBreakoutStrategy()
-    sig = strat.signals(df, {"period": 20, "num_std": 2.0})
-    assert sig.iloc[-1] == 1
-
-
-def test_bollinger_breakout_flat_before_warmup():
-    closes = [1.10 + 0.0001 * i for i in range(10)]
-    df = make_price_df(closes)
-    strat = BollingerBreakoutStrategy()
-    sig = strat.signals(df, {"period": 20, "num_std": 2.0})
-    assert (sig == 0).all()
 
 
 def make_orb_df(prices: list[float], start: str = "2026-01-05T00:00:00Z") -> pd.DataFrame:
@@ -152,3 +72,53 @@ def test_orb_resets_for_a_new_day():
     assert (sig.iloc[day2_start:day2_start + 5] == 0).all()
     # day 2's own breakout is detected fresh, independent of day 1's box levels.
     assert sig.iloc[-1] == 1
+
+
+def test_risk_distances_defaults_to_fixed_pips_passthrough():
+    df = make_orb_df([1.1000] * 5)
+    strat = OpeningRangeBreakoutStrategy()
+    sl, tp = strat.risk_distances(df, {"session_open_hour": 0, "box_minutes": 10}, 60, 15)
+    assert (sl, tp) == (60, 15)
+
+
+def test_risk_distances_box_mode_scales_by_box_height():
+    # box high=1.1010, low=1.1000 -> height = 0.0010 = 10 pips (EUR_USD pip = 0.0001)
+    box_prices = [1.1000, 1.1010, 1.1002, 1.1008, 1.1000, 1.1005, 1.1001, 1.1009, 1.1003, 1.1006]
+    df = make_orb_df(box_prices + [1.1015])  # one bar past the box so box_high/low are known
+    strat = OpeningRangeBreakoutStrategy()
+    params = {
+        "session_open_hour": 0, "box_minutes": 10, "risk_mode": "box", "instrument": "EUR_USD",
+    }
+    sl, tp = strat.risk_distances(df, params, 1.5, 0.5)
+    assert sl[-1] == pytest.approx(15.0)  # 1.5x 10-pip box height
+    assert tp[-1] == pytest.approx(5.0)  # 0.5x 10-pip box height
+
+
+def test_direction_filter_long_blocks_short_entries():
+    box_prices = [1.1000, 1.1010, 1.1002, 1.1008, 1.1000, 1.1005, 1.1001, 1.1009, 1.1003, 1.1006]
+    breakdown_prices = [1.0990, 1.0980]  # breaks box low (1.1000) -> would normally go short
+    df = make_orb_df(box_prices + breakdown_prices)
+    strat = OpeningRangeBreakoutStrategy()
+    sig = strat.signals(df, {"session_open_hour": 0, "box_minutes": 10, "direction_filter": "long"})
+    assert (sig.iloc[10:] == 0).all()  # short entry blocked, stays flat
+
+
+def test_direction_filter_short_blocks_long_entries():
+    box_prices = [1.1000, 1.1010, 1.1002, 1.1008, 1.1000, 1.1005, 1.1001, 1.1009, 1.1003, 1.1006]
+    breakout_prices = [1.1015, 1.1025]  # breaks box high (1.1010) -> would normally go long
+    df = make_orb_df(box_prices + breakout_prices)
+    strat = OpeningRangeBreakoutStrategy()
+    sig = strat.signals(df, {"session_open_hour": 0, "box_minutes": 10, "direction_filter": "short"})
+    assert (sig.iloc[10:] == 0).all()  # long entry blocked, stays flat
+
+
+def test_direction_filter_short_still_allows_short_entries_and_exits():
+    box_prices = [1.1000, 1.1010, 1.1002, 1.1008, 1.1000, 1.1005, 1.1001, 1.1009, 1.1003, 1.1006]
+    # box low=1.1000, mid=1.1005
+    prices_after = [1.0990, 1.0980, 1.1005, 1.1006]
+    df = make_orb_df(box_prices + prices_after)
+    strat = OpeningRangeBreakoutStrategy()
+    sig = strat.signals(df, {"session_open_hour": 0, "box_minutes": 10, "direction_filter": "short"})
+    assert sig.iloc[10] == -1  # 1.0990 < 1.1000 -> breaks out short
+    assert sig.iloc[11] == -1
+    assert sig.iloc[12] == 0  # 1.1005 >= mid(1.1005) -> reverts to flat

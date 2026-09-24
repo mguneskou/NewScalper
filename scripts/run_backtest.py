@@ -28,13 +28,10 @@ from scalper.backtest.metrics import compute_metrics
 from scalper.backtest.optimizer import run_walk_forward
 from scalper.config import load_settings
 from scalper.data.history import load_cached
-from scalper.data.storage import connect, save_backtest_run
-from scalper.strategies.bollinger_breakout import BollingerBreakoutStrategy
-from scalper.strategies.ema_cross import EmaCrossStrategy
+from scalper.data.storage import connect, save_active_params, save_backtest_run
 from scalper.strategies.opening_range_breakout import OpeningRangeBreakoutStrategy
-from scalper.strategies.rsi_reversion import RsiReversionStrategy
 
-ALL_STRATEGIES = [EmaCrossStrategy, RsiReversionStrategy, BollingerBreakoutStrategy, OpeningRangeBreakoutStrategy]
+ALL_STRATEGIES = [OpeningRangeBreakoutStrategy]
 STARTING_BALANCE = 10_000.0
 
 
@@ -48,6 +45,18 @@ def _clip_to_recent_years(df: pd.DataFrame, years: float) -> pd.DataFrame:
     return df.loc[times >= cutoff].reset_index(drop=True)
 
 
+def _clip_to_range(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
+    """Keeps only candles in [start, end) -- lets a run be scoped to a
+    specific historical slice (e.g. re-validating a previously tuned window
+    against an earlier, non-overlapping period) instead of only "the most
+    recent N years"."""
+    if df.empty:
+        return df
+    times = pd.to_datetime(df["time"])
+    mask = (times >= pd.Timestamp(start, tz="UTC")) & (times < pd.Timestamp(end, tz="UTC"))
+    return df.loc[mask].reset_index(drop=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -56,21 +65,49 @@ def main() -> int:
     )
     parser.add_argument(
         "--strategies", nargs="+", default=None,
-        help="Override which strategies to run, by name, e.g. --strategies rsi_reversion bollinger_breakout",
+        help="Override which strategies to run, by name, e.g. --strategies opening_range_breakout",
+    )
+    parser.add_argument(
+        "--instruments", nargs="+", default=None,
+        help="Override config/settings.yaml instruments, e.g. --instruments GBP_USD",
     )
     parser.add_argument(
         "--years", type=float, default=None,
         help="Only use the most recent N years of cached data (default: settings.yaml backtest.years)",
     )
+    parser.add_argument(
+        "--start", type=str, default=None,
+        help="Explicit ISO start date (e.g. 2025-03-01) -- overrides --years. Use with --end.",
+    )
+    parser.add_argument(
+        "--end", type=str, default=None,
+        help="Explicit ISO end date (exclusive) -- overrides --years. Use with --start.",
+    )
+    parser.add_argument(
+        "--skip-active-params", action="store_true",
+        help="Don't update active_params from this run -- use for validation-only runs on "
+             "historical windows, so a check against older data doesn't clobber the current "
+             "best (most recent) live params with stale ones.",
+    )
+    parser.add_argument(
+        "--train-months", type=int, default=None,
+        help="Override settings.yaml backtest.train_months (walk-forward training window length)",
+    )
+    parser.add_argument(
+        "--validate-months", type=int, default=None,
+        help="Override settings.yaml backtest.validate_months (walk-forward validation window length)",
+    )
     parser.add_argument("--max-workers", type=int, default=None)
     args = parser.parse_args()
 
     settings = load_settings()
-    instruments = settings["instruments"]
+    instruments = args.instruments or settings["instruments"]
     granularities = args.granularities or settings["granularities"]
     bt_cfg = settings["backtest"]
     account_currency = settings["account_currency"]
     years = args.years if args.years is not None else bt_cfg["years"]
+    train_months = args.train_months if args.train_months is not None else bt_cfg["train_months"]
+    validate_months = args.validate_months if args.validate_months is not None else bt_cfg["validate_months"]
 
     strategies = ALL_STRATEGIES
     if args.strategies:
@@ -82,7 +119,8 @@ def main() -> int:
 
     # max_concurrent_positions is a live-trading portfolio control, not meaningful
     # for this single-instrument, single-position-at-a-time backtest engine.
-    risk_grid = {k: v for k, v in settings["risk_search"].items() if k != "max_concurrent_positions"}
+    base_risk_grid = {k: v for k, v in settings["risk_search"].items() if k != "max_concurrent_positions"}
+    instrument_overrides = settings.get("instrument_overrides", {})
 
     cost_model = CostModel(
         slippage_pips=bt_cfg["slippage_pips"],
@@ -100,11 +138,13 @@ def main() -> int:
     total_jobs = len(jobs)
     run_start = time.time()
     summary_rows = []
-    print(f"account_currency={account_currency} years={years}", flush=True)
+    window_desc = f"{args.start}->{args.end}" if args.start else f"years={years}"
+    print(f"account_currency={account_currency} {window_desc}", flush=True)
 
     with connect() as conn:
         for job_index, (strategy_cls, instrument, granularity) in enumerate(jobs, start=1):
-            df = _clip_to_recent_years(load_cached(instrument, granularity), years)
+            cached = load_cached(instrument, granularity)
+            df = _clip_to_range(cached, args.start, args.end) if args.start else _clip_to_recent_years(cached, years)
             strategy = strategy_cls()
             print(
                 f"[job {job_index}/{total_jobs}] {strategy.name} on {instrument} {granularity} "
@@ -112,6 +152,9 @@ def main() -> int:
                 flush=True,
             )
 
+            overrides = instrument_overrides.get(instrument, {})
+            risk_grid = {**base_risk_grid, **overrides.get("risk_search", {})}
+            param_grid = {**strategy.param_grid, **overrides.get("strategy_params", {})}
             job_start = time.time()
 
             def on_window_done(window_index, total_windows, window_result, _strategy=strategy,
@@ -147,16 +190,38 @@ def main() -> int:
 
             window_results = run_walk_forward(
                 df, strategy, instrument, risk_grid, cost_model,
-                train_months=bt_cfg["train_months"],
-                validate_months=bt_cfg["validate_months"],
+                train_months=train_months,
+                validate_months=validate_months,
                 max_workers=args.max_workers,
                 on_window_done=on_window_done,
                 account_currency=account_currency,
                 granularity=granularity,
+                param_grid=param_grid,
             )
             if not window_results:
                 print("  not enough data for even one walk-forward window, skipping", flush=True)
                 continue
+
+            # "Active" params always reflect the most recently trained window, not a
+            # frozen/named config -- re-running this script with fresh data and
+            # calling this again is the entire update mechanism (see storage.py).
+            # Skipped for validation-only runs on historical windows (--skip-active-params),
+            # so checking an older period doesn't clobber the current best live params.
+            if not args.skip_active_params:
+                latest_window = window_results[-1]
+                save_active_params(
+                    conn,
+                    strategy_name=strategy.name,
+                    instrument=instrument,
+                    granularity=granularity,
+                    params=latest_window.best_params,
+                    train_start=str(latest_window.train_start),
+                    train_end=str(latest_window.train_end),
+                    validate_start=str(latest_window.validate_start),
+                    validate_end=str(latest_window.validate_end),
+                    metrics=latest_window.validate_metrics,
+                )
+                conn.commit()
 
             oos_trades = sorted(
                 (t for w in window_results for t in w.validate_trades),

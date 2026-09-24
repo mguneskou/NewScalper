@@ -58,10 +58,16 @@ def _evaluate_combo(args: tuple) -> tuple[dict, Metrics]:
     # threshold), not a swept hyperparameter -- injected here rather than stored
     # in strategy_params/param_grid so it doesn't get persisted redundantly
     # alongside the instrument column already in backtest_runs.
-    signals = strategy.signals(_worker_df, {**strategy_params, "instrument": _worker_instrument})
+    full_params = {**strategy_params, "instrument": _worker_instrument}
+    signals = strategy.signals(_worker_df, full_params)
+    # risk_distances() lets a strategy reinterpret the risk grid's (sl, tp)
+    # values as something other than fixed pips (e.g. ORB's box-relative
+    # mode treats them as fractions of that day's own box height) -- default
+    # passthrough for every strategy that doesn't override it.
+    sl_dist, tp_dist = strategy.risk_distances(_worker_df, full_params, sl, tp)
     result = run_backtest(
         _worker_df, signals, _worker_instrument,
-        stop_loss_pips=sl, take_profit_pips=tp, position_size_units=size,
+        stop_loss_pips=sl_dist, take_profit_pips=tp_dist, position_size_units=size,
         cost_model=_worker_cost_model,
         account_currency=_worker_account_currency, fx=_worker_fx,
     )
@@ -83,6 +89,17 @@ def _param_combinations(grid: dict[str, list]) -> list[dict]:
 def walk_forward_windows(
     df: pd.DataFrame, train_months: int, validate_months: int
 ) -> list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
+    """`validate_end` is clamped to the last available timestamp rather than
+    requiring the full `validate_months` to be present, so a caller asking
+    for e.g. exactly `train_months + validate_months` of data (via `--years`
+    or `--start`/`--end`) doesn't need to pad it by hand: calendar months
+    aren't a fixed number of days (28-31), so an "exact" day-based span is
+    frequently a few hours to a few days short of what DateOffset(months=...)
+    needs, and used to make the whole window silently disappear ("not enough
+    data for even one walk-forward window") instead of just running slightly
+    short. `train_end` is NOT clamped -- a full training window is still
+    required, since a partial one would mean parameters chosen on less data
+    than requested rather than just a slightly shorter validation check."""
     times = pd.to_datetime(df["time"])
     start, end = times.iloc[0], times.iloc[-1]
 
@@ -90,8 +107,10 @@ def walk_forward_windows(
     train_start = start
     while True:
         train_end = train_start + pd.DateOffset(months=train_months)
-        validate_end = train_end + pd.DateOffset(months=validate_months)
-        if validate_end > end:
+        if train_end > end:
+            break
+        validate_end = min(train_end + pd.DateOffset(months=validate_months), end)
+        if validate_end <= train_end:
             break
         windows.append((train_start, train_end, train_end, validate_end))
         train_start = train_start + pd.DateOffset(months=validate_months)
@@ -115,6 +134,7 @@ def grid_search_train(
     max_workers: int | None = None,
     account_currency: str = "USD",
     granularity: str = "M5",
+    param_grid: dict[str, list] | None = None,
 ) -> list[tuple[dict, Metrics]]:
     """Evaluates every (strategy params x risk params) combo on df_train,
     returns all (params, metrics) pairs sorted best-first by `objective`.
@@ -137,8 +157,12 @@ def grid_search_train(
     handful of lucky trades can produce an extreme but meaningless R-multiple
     average). If every combo falls below `min_trades` (e.g. a very short
     training window), the filter is skipped rather than returning nothing.
+
+    `param_grid` overrides `strategy.param_grid` when given (e.g. an
+    instrument-specific search space via `resolve_grid`); defaults to the
+    strategy's own grid otherwise.
     """
-    strategy_combos = _param_combinations(strategy.param_grid)
+    strategy_combos = _param_combinations(param_grid if param_grid is not None else strategy.param_grid)
     risk_combos = _param_combinations(risk_grid)
 
     tasks = [
@@ -185,6 +209,7 @@ def run_walk_forward(
     on_window_done=None,
     account_currency: str = "USD",
     granularity: str = "M5",
+    param_grid: dict[str, list] | None = None,
 ) -> list[WindowResult]:
     """`on_window_done`, if given, is called as on_window_done(window_index,
     total_windows, WindowResult) right after each window finishes -- lets a
@@ -192,7 +217,9 @@ def run_walk_forward(
     waiting for the entire (potentially long) walk-forward run to complete.
 
     See `grid_search_train` for why `objective` defaults to `avg_r_multiple`
-    (risk-normalized) with a `min_trades` floor, rather than raw `total_pnl`."""
+    (risk-normalized) with a `min_trades` floor, rather than raw `total_pnl`.
+    `param_grid` overrides `strategy.param_grid` when given -- see
+    `resolve_grid`."""
     windows = walk_forward_windows(df, train_months, validate_months)
     results: list[WindowResult] = []
     fx = FxConverter(account_currency, granularity)
@@ -207,16 +234,21 @@ def run_walk_forward(
             df_train, strategy, risk_grid, instrument, cost_model,
             objective=objective, min_trades=min_trades, max_workers=max_workers,
             account_currency=account_currency, granularity=granularity,
+            param_grid=param_grid,
         )
         if not ranked:
             continue
         best_params, train_metrics = ranked[0]
 
-        signals = strategy.signals(df_validate, {**best_params, "instrument": instrument})
+        validate_params = {**best_params, "instrument": instrument}
+        signals = strategy.signals(df_validate, validate_params)
+        sl_dist, tp_dist = strategy.risk_distances(
+            df_validate, validate_params, best_params["stop_loss_pips"], best_params["take_profit_pips"]
+        )
         validate_result = run_backtest(
             df_validate, signals, instrument,
-            stop_loss_pips=best_params["stop_loss_pips"],
-            take_profit_pips=best_params["take_profit_pips"],
+            stop_loss_pips=sl_dist,
+            take_profit_pips=tp_dist,
             position_size_units=best_params["position_size_units"],
             cost_model=cost_model,
             account_currency=account_currency, fx=fx,
